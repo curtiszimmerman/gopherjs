@@ -2,23 +2,24 @@ package compiler
 
 import (
 	"bytes"
-	"code.google.com/p/go.tools/go/gcimporter"
-	"code.google.com/p/go.tools/go/types"
-	"encoding/asn1"
 	"encoding/binary"
+	"encoding/gob"
 	"encoding/json"
 	"fmt"
-	"github.com/gopherjs/gopherjs/compiler/prelude"
 	"go/token"
 	"io"
 	"strings"
+
+	"github.com/gopherjs/gopherjs/compiler/prelude"
+	"golang.org/x/tools/go/gcimporter"
+	"golang.org/x/tools/go/types"
 )
 
 var sizes32 = &types.StdSizes{WordSize: 4, MaxAlign: 8}
 var reservedKeywords = make(map[string]bool)
 
 func init() {
-	for _, keyword := range []string{"abstract", "arguments", "boolean", "break", "byte", "case", "catch", "char", "class", "const", "continue", "debugger", "default", "delete", "do", "double", "else", "enum", "eval", "export", "extends", "false", "final", "finally", "float", "for", "function", "goto", "if", "implements", "import", "in", "instanceof", "int", "interface", "let", "long", "native", "new", "package", "private", "protected", "public", "return", "short", "static", "super", "switch", "synchronized", "this", "throw", "throws", "transient", "true", "try", "typeof", "var", "void", "volatile", "while", "with", "yield"} {
+	for _, keyword := range []string{"abstract", "arguments", "boolean", "break", "byte", "case", "catch", "char", "class", "const", "continue", "debugger", "default", "delete", "do", "double", "else", "enum", "eval", "export", "extends", "false", "final", "finally", "float", "for", "function", "goto", "if", "implements", "import", "in", "instanceof", "int", "interface", "let", "long", "native", "new", "null", "package", "private", "protected", "public", "return", "short", "static", "super", "switch", "synchronized", "this", "throw", "throws", "transient", "true", "try", "typeof", "undefined", "var", "void", "volatile", "while", "with", "yield"} {
 		reservedKeywords[keyword] = true
 	}
 }
@@ -29,34 +30,55 @@ func (err ErrorList) Error() string {
 	return err[0].Error()
 }
 
-type ImportContext struct {
-	Packages map[string]*types.Package
-	Import   func(string) (*Archive, error)
-}
-
-func NewImportContext(importFunc func(string) (*Archive, error)) *ImportContext {
-	return &ImportContext{
-		Packages: map[string]*types.Package{"unsafe": types.Unsafe},
-		Import:   importFunc,
+func ImportDependencies(archive *Archive, importPkg func(string) (*Archive, error)) ([]*Archive, error) {
+	var deps []*Archive
+	paths := make(map[string]bool)
+	var collectDependencies func(path string) error
+	collectDependencies = func(path string) error {
+		if paths[path] {
+			return nil
+		}
+		dep, err := importPkg(path)
+		if err != nil {
+			return err
+		}
+		for _, imp := range dep.Imports {
+			if err := collectDependencies(imp); err != nil {
+				return err
+			}
+		}
+		deps = append(deps, dep)
+		paths[dep.ImportPath] = true
+		return nil
 	}
+
+	if err := collectDependencies("runtime"); err != nil {
+		return nil, err
+	}
+	for _, imp := range archive.Imports {
+		if err := collectDependencies(imp); err != nil {
+			return nil, err
+		}
+	}
+
+	deps = append(deps, archive)
+	return deps, nil
 }
 
-func WriteProgramCode(pkgs []*Archive, importContext *ImportContext, w *SourceMapFilter) error {
+func WriteProgramCode(pkgs []*Archive, w *SourceMapFilter) error {
 	mainPkg := pkgs[len(pkgs)-1]
 	minify := mainPkg.Minified
 
 	declsByObject := make(map[string][]*Decl)
 	var pendingDecls []*Decl
 	for _, pkg := range pkgs {
-		for i := range pkg.Declarations {
-			d := &pkg.Declarations[i]
+		for _, d := range pkg.Declarations {
 			if len(d.DceFilters) == 0 {
 				pendingDecls = append(pendingDecls, d)
 				continue
 			}
 			for _, f := range d.DceFilters {
-				o := string(pkg.ImportPath) + ":" + string(f)
-				declsByObject[o] = append(declsByObject[o], d)
+				declsByObject[f] = append(declsByObject[f], d)
 			}
 		}
 	}
@@ -65,13 +87,11 @@ func WriteProgramCode(pkgs []*Archive, importContext *ImportContext, w *SourceMa
 		d := pendingDecls[len(pendingDecls)-1]
 		pendingDecls = pendingDecls[:len(pendingDecls)-1]
 		for _, dep := range d.DceDeps {
-			o := string(dep)
-			if decls, ok := declsByObject[o]; ok {
-				delete(declsByObject, o)
-				name := strings.Split(o, ":")[1]
+			if decls, ok := declsByObject[dep]; ok {
+				delete(declsByObject, dep)
 				for _, d := range decls {
 					for i, f := range d.DceFilters {
-						if string(f) == name {
+						if f == dep {
 							d.DceFilters[i] = d.DceFilters[len(d.DceFilters)-1]
 							d.DceFilters = d.DceFilters[:len(d.DceFilters)-1]
 							break
@@ -102,7 +122,7 @@ func WriteProgramCode(pkgs []*Archive, importContext *ImportContext, w *SourceMa
 		}
 	}
 
-	if _, err := w.Write([]byte("$go($packages[\"" + string(mainPkg.ImportPath) + "\"].$run, [], true);\n\n})();\n")); err != nil {
+	if _, err := w.Write([]byte("$go($packages[\"" + string(mainPkg.ImportPath) + "\"].$init, [], true);\n$flushConsole();\n\n})();\n")); err != nil {
 		return err
 	}
 
@@ -120,49 +140,34 @@ func WritePkgCode(pkg *Archive, minify bool, w *SourceMapFilter) error {
 		return err
 	}
 	vars := []string{"$pkg = {}"}
-	for i := range pkg.Imports {
-		vars = append(vars, fmt.Sprintf("%s = $packages[\"%s\"]", pkg.Imports[i].VarName, pkg.Imports[i].Path))
-	}
-	for i := range pkg.Declarations {
-		if len(pkg.Declarations[i].DceFilters) == 0 {
-			vars = append(vars, pkg.Declarations[i].Vars...)
+	for _, d := range pkg.Declarations {
+		if len(d.DceFilters) == 0 {
+			vars = append(vars, d.Vars...)
 		}
 	}
-	if len(vars) != 0 {
-		if _, err := w.Write(removeWhitespace([]byte(fmt.Sprintf("\tvar %s;\n", strings.Join(vars, ", "))), minify)); err != nil {
-			return err
-		}
-	}
-	for i := range pkg.Declarations {
-		if len(pkg.Declarations[i].DceFilters) == 0 {
-			if _, err := w.Write(pkg.Declarations[i].BodyCode); err != nil {
-				return err
-			}
-		}
-	}
-
-	if _, err := w.Write(removeWhitespace([]byte("\t$pkg.$init = function() {\n"), minify)); err != nil {
+	if _, err := w.Write(removeWhitespace([]byte(fmt.Sprintf("\tvar %s;\n", strings.Join(vars, ", "))), minify)); err != nil {
 		return err
 	}
-	if pkg.BlockingInit {
-		if _, err := w.Write(removeWhitespace([]byte("\t\t/* */ var $r, $s = 0; var $f = function() { while (true) { switch ($s) { case 0:\n"), minify)); err != nil {
-			return err
+	for _, d := range pkg.Declarations {
+		if len(d.DceFilters) == 0 {
+			if _, err := w.Write(d.BodyCode); err != nil {
+				return err
+			}
+		} else {
 		}
 	}
-	for i := range pkg.Declarations {
-		if len(pkg.Declarations[i].DceFilters) == 0 {
-			if _, err := w.Write(pkg.Declarations[i].InitCode); err != nil {
+
+	if _, err := w.Write(removeWhitespace([]byte("\t$pkg.$init = function() {\n\t\t$pkg.$init = function() {};\n\t\t/* */ var $r, $s = 0; var $f = function() { while (true) { switch ($s) { case 0:\n"), minify)); err != nil {
+		return err
+	}
+	for _, d := range pkg.Declarations {
+		if len(d.DceFilters) == 0 {
+			if _, err := w.Write(d.InitCode); err != nil {
 				return err
 			}
 		}
 	}
-	if pkg.BlockingInit {
-		if _, err := w.Write(removeWhitespace([]byte("\t\t/* */ } return; } }; $f.$blocking = true; return $f;\n"), minify)); err != nil {
-			return err
-		}
-	}
-
-	if _, err := w.Write(removeWhitespace([]byte("\t};\n\treturn $pkg;\n})();"), minify)); err != nil {
+	if _, err := w.Write(removeWhitespace([]byte("\t\t/* */ } return; } }; $f.$blocking = true; return $f;\n\t};\n\treturn $pkg;\n})();"), minify)); err != nil {
 		return err
 	}
 	if _, err := w.Write([]byte("\n")); err != nil { // keep this \n even when minified
@@ -171,72 +176,43 @@ func WritePkgCode(pkg *Archive, minify bool, w *SourceMapFilter) error {
 	return nil
 }
 
-func UnmarshalArchive(filename, id string, data []byte, importContext *ImportContext) (*Archive, error) {
+func ReadArchive(filename, id string, r io.Reader, packages map[string]*types.Package) (*Archive, error) {
 	var a Archive
-	_, err := asn1.Unmarshal(data, &a)
-	if err != nil {
+	if err := gob.NewDecoder(r).Decode(&a); err != nil {
 		return nil, err
 	}
 
-	pkg, err := gcimporter.ImportData(importContext.Packages, filename, id, bytes.NewReader(a.GcData))
+	pkg, err := gcimporter.ImportData(packages, filename, id, bytes.NewReader(a.GcData))
 	if err != nil {
 		return nil, err
 	}
-	importContext.Packages[pkg.Path()] = pkg
+	packages[pkg.Path()] = pkg
 
 	return &a, nil
 }
 
-func MarshalArchive(a *Archive) ([]byte, error) {
-	return asn1.Marshal(*a)
+func WriteArchive(a *Archive, w io.Writer) error {
+	return gob.NewEncoder(w).Encode(a)
 }
 
 type Archive struct {
-	ImportPath   PkgPath
+	ImportPath   string
+	Imports      []string
 	GcData       []byte
-	Dependencies []PkgPath
-	Imports      []PkgImport
-	Declarations []Decl
-	Tests        []string
+	Declarations []*Decl
 	FileSet      []byte
-	BlockingInit bool
 	Minified     bool
 }
 
-type PkgPath []byte // make asn1 happy
-
-func (a *Archive) AddDependency(path string) {
-	for _, dep := range a.Dependencies {
-		if string(dep) == path {
-			return
-		}
-	}
-	a.Dependencies = append(a.Dependencies, PkgPath(path))
-}
-
-func (a *Archive) AddDependenciesOf(other *Archive) {
-	for _, path := range other.Dependencies {
-		a.AddDependency(string(path))
-	}
-	a.AddDependency(string(other.ImportPath))
-}
-
-type PkgImport struct {
-	Path    PkgPath
-	VarName string
-}
-
 type Decl struct {
-	FullName   []byte
+	FullName   string
 	Vars       []string
 	BodyCode   []byte
 	InitCode   []byte
-	DceFilters []DepId
-	DceDeps    []DepId
+	DceFilters []string
+	DceDeps    []string
 	Blocking   bool
 }
-
-type DepId []byte // make asn1 happy
 
 type SourceMapFilter struct {
 	Writer          io.Writer

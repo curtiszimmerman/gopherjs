@@ -1,13 +1,14 @@
 package gcexporter
 
 import (
-	"code.google.com/p/go.tools/go/exact"
-	"code.google.com/p/go.tools/go/types"
 	"fmt"
 	"io"
 	"strconv"
 	"strings"
 	"unicode"
+
+	"golang.org/x/tools/go/exact"
+	"golang.org/x/tools/go/types"
 )
 
 type exporter struct {
@@ -68,12 +69,15 @@ func Write(pkg *types.Package, out io.Writer, sizes types.Sizes) {
 			case basic.Info()&types.IsBoolean != 0:
 				val = strconv.FormatBool(exact.BoolVal(o.Val()))
 			case basic.Info()&types.IsInteger != 0:
-				if basic.Kind() == types.Uint64 {
-					d, _ := exact.Uint64Val(o.Val())
+				d, ok := exact.Int64Val(o.Val())
+				if !ok {
+					d, ok := exact.Uint64Val(o.Val())
+					if !ok {
+						panic("could not export integer")
+					}
 					val = fmt.Sprintf("%#x", d)
 					break
 				}
-				d, _ := exact.Int64Val(o.Val())
 				if basic.Kind() == types.UntypedRune {
 					switch {
 					case d < 0 || d > unicode.MaxRune:

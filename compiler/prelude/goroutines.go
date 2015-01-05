@@ -43,27 +43,34 @@ var $callDeferred = function(deferred, jsErr) {
     $panicValue = localPanicValue;
   }
 
-  var call;
+  var call, localSkippedDeferFrames = 0;
   try {
     while (true) {
       if (deferred === null) {
-        deferred = $deferFrames[$deferFrames.length - 1 - $skippedDeferFrames];
+        deferred = $deferFrames[$deferFrames.length - 1 - localSkippedDeferFrames];
         if (deferred === undefined) {
+          var msg;
           if (localPanicValue.constructor === $String) {
-            throw new Error(localPanicValue.$val);
+            msg = localPanicValue.$val;
           } else if (localPanicValue.Error !== undefined) {
-            throw new Error(localPanicValue.Error());
+            msg = localPanicValue.Error();
           } else if (localPanicValue.String !== undefined) {
-            throw new Error(localPanicValue.String());
+            msg = localPanicValue.String();
           } else {
-            throw new Error(localPanicValue);
+            msg = localPanicValue;
           }
+          var e = new Error(msg);
+          if (localPanicValue.Stack !== undefined) {
+            e.stack = localPanicValue.Stack();
+            e.stack = msg + e.stack.substr(e.stack.indexOf("\n"));
+          }
+          throw e;
         }
       }
       var call = deferred.pop();
       if (call === undefined) {
         if (localPanicValue !== undefined) {
-          $skippedDeferFrames++;
+          localSkippedDeferFrames++;
           deferred = null;
           continue;
         }
@@ -79,6 +86,7 @@ var $callDeferred = function(deferred, jsErr) {
       }
     }
   } finally {
+    $skippedDeferFrames += localSkippedDeferFrames;
     if ($curGoroutine.asleep) {
       deferred.push(call);
       $jumpToDefer = true;
@@ -105,19 +113,22 @@ var $recover = function() {
   $panicStackDepth = null;
   return $panicValue;
 };
-var $nonblockingCall = function() {
-  $panic(new $packages["runtime"].NotSupportedError.Ptr("non-blocking call to blocking function (mark call with \"//gopherjs:blocking\" to fix)"));
-};
 var $throw = function(err) { throw err; };
 var $throwRuntimeError; /* set by package "runtime" */
+
+var $BLOCKING = new Object();
+var $nonblockingCall = function() {
+  $panic(new $packages["runtime"].NotSupportedError.Ptr("non-blocking call to blocking function, see https://github.com/gopherjs/gopherjs#goroutines"));
+};
 
 var $dummyGoroutine = { asleep: false, exit: false, panicStack: [] };
 var $curGoroutine = $dummyGoroutine, $totalGoroutines = 0, $awakeGoroutines = 0, $checkForDeadlock = true;
 var $go = function(fun, args, direct) {
   $totalGoroutines++;
   $awakeGoroutines++;
-  args.push(true);
+  args.push($BLOCKING);
   var goroutine = function() {
+    var rescheduled = false;
     try {
       $curGoroutine = goroutine;
       $skippedDeferFrames = 0;
@@ -127,6 +138,7 @@ var $go = function(fun, args, direct) {
         fun = r;
         args = [];
         $schedule(goroutine, direct);
+        rescheduled = true;
         return;
       }
       goroutine.exit = true;
@@ -137,14 +149,14 @@ var $go = function(fun, args, direct) {
       }
     } finally {
       $curGoroutine = $dummyGoroutine;
-      if (goroutine.exit) { /* also set by runtime.Goexit() */
+      if (goroutine.exit && !rescheduled) { /* also set by runtime.Goexit() */
         $totalGoroutines--;
         goroutine.asleep = true;
       }
-      if (goroutine.asleep) {
+      if (goroutine.asleep && !rescheduled) {
         $awakeGoroutines--;
         if ($awakeGoroutines === 0 && $totalGoroutines !== 0 && $checkForDeadlock) {
-          $panic(new $String("fatal error: all goroutines are asleep - deadlock!"));
+          console.error("fatal error: all goroutines are asleep - deadlock!");
         }
       }
     }

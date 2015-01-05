@@ -9,8 +9,8 @@ import (
 	"strconv"
 	"strings"
 
-	"code.google.com/p/go.tools/go/exact"
-	"code.google.com/p/go.tools/go/types"
+	"golang.org/x/tools/go/exact"
+	"golang.org/x/tools/go/types"
 )
 
 type expression struct {
@@ -41,13 +41,23 @@ func (c *funcContext) translateExpr(expr ast.Expr) *expression {
 			return c.formatExpr("%s", strconv.FormatBool(exact.BoolVal(value)))
 		case basic.Info()&types.IsInteger != 0:
 			if is64Bit(basic) {
-				d, _ := exact.Uint64Val(value)
 				if basic.Kind() == types.Int64 {
-					return c.formatExpr("new %s(%s, %s)", c.typeName(exprType), strconv.FormatInt(int64(d)>>32, 10), strconv.FormatUint(d&(1<<32-1), 10))
+					d, ok := exact.Int64Val(value)
+					if !ok {
+						panic("could not get exact uint")
+					}
+					return c.formatExpr("new %s(%s, %s)", c.typeName(exprType), strconv.FormatInt(d>>32, 10), strconv.FormatUint(uint64(d)&(1<<32-1), 10))
+				}
+				d, ok := exact.Uint64Val(value)
+				if !ok {
+					panic("could not get exact uint")
 				}
 				return c.formatExpr("new %s(%s, %s)", c.typeName(exprType), strconv.FormatUint(d>>32, 10), strconv.FormatUint(d&(1<<32-1), 10))
 			}
-			d, _ := exact.Int64Val(value)
+			d, ok := exact.Int64Val(value)
+			if !ok {
+				panic("could not get exact int")
+			}
 			return c.formatExpr("%s", strconv.FormatInt(d, 10))
 		case basic.Info()&types.IsFloat != 0:
 			f, _ := exact.Float64Val(value)
@@ -66,6 +76,39 @@ func (c *funcContext) translateExpr(expr ast.Expr) *expression {
 		}
 	}
 
+	var obj types.Object
+	switch e := expr.(type) {
+	case *ast.SelectorExpr:
+		obj = c.p.info.Uses[e.Sel]
+	case *ast.Ident:
+		obj = c.p.info.Defs[e]
+		if obj == nil {
+			obj = c.p.info.Uses[e]
+		}
+	}
+
+	if obj != nil && isJsPackage(obj.Pkg()) {
+		switch obj.Name() {
+		case "Global":
+			return c.formatExpr("$global")
+		case "This":
+			if len(c.flattened) != 0 {
+				return c.formatExpr("$this")
+			}
+			return c.formatExpr("this")
+		case "Arguments":
+			args := "arguments"
+			if len(c.flattened) != 0 {
+				args = "$args"
+			}
+			return c.formatExpr(`new ($sliceType(%s.Object))($global.Array.prototype.slice.call(%s, []))`, c.p.pkgVars["github.com/gopherjs/gopherjs/js"], args)
+		case "Module":
+			return c.formatExpr("$module")
+		case "Undefined":
+			return c.formatExpr("undefined")
+		}
+	}
+
 	switch e := expr.(type) {
 	case *ast.CompositeLit:
 		if ptrType, isPointer := exprType.(*types.Pointer); isPointer {
@@ -73,12 +116,15 @@ func (c *funcContext) translateExpr(expr ast.Expr) *expression {
 		}
 
 		collectIndexedElements := func(elementType types.Type) []string {
-			elements := make([]string, 0)
+			var elements []string
 			i := 0
 			zero := c.zeroValue(elementType)
 			for _, element := range e.Elts {
 				if kve, isKve := element.(*ast.KeyValueExpr); isKve {
-					key, _ := exact.Int64Val(c.p.info.Types[kve.Key].Value)
+					key, ok := exact.Int64Val(c.p.info.Types[kve.Key].Value)
+					if !ok {
+						panic("could not get exact int")
+					}
 					i = int(key)
 					element = kve.Value
 				}
@@ -101,7 +147,7 @@ func (c *funcContext) translateExpr(expr ast.Expr) *expression {
 			for len(elements) < int(t.Len()) {
 				elements = append(elements, zero)
 			}
-			return c.formatExpr(`$toNativeArray("%s", [%s])`, typeKind(t.Elem()), strings.Join(elements, ", "))
+			return c.formatExpr(`$toNativeArray(%s, [%s])`, typeKind(t.Elem()), strings.Join(elements, ", "))
 		case *types.Slice:
 			return c.formatExpr("new %s([%s])", c.typeName(exprType), strings.Join(collectIndexedElements(t.Elem()), ", "))
 		case *types.Map:
@@ -110,7 +156,7 @@ func (c *funcContext) translateExpr(expr ast.Expr) *expression {
 			assignments := ""
 			for _, element := range e.Elts {
 				kve := element.(*ast.KeyValueExpr)
-				assignments += c.formatExpr(`%s = %s, %s[%s] = { k: %s, v: %s }, `, keyVar, c.translateImplicitConversion(kve.Key, t.Key()), mapVar, c.makeKey(c.newIdent(keyVar, t.Key()), t.Key()), keyVar, c.translateImplicitConversion(kve.Value, t.Elem())).String()
+				assignments += c.formatExpr(`%s = %s, %s[%s] = { k: %s, v: %s }, `, keyVar, c.translateImplicitConversionWithCloning(kve.Key, t.Key()), mapVar, c.makeKey(c.newIdent(keyVar, t.Key()), t.Key()), keyVar, c.translateImplicitConversionWithCloning(kve.Value, t.Elem())).String()
 			}
 			return c.formatExpr("(%s = new $Map(), %s%s)", mapVar, assignments, mapVar)
 		case *types.Struct:
@@ -121,7 +167,7 @@ func (c *funcContext) translateExpr(expr ast.Expr) *expression {
 			}
 			if !isKeyValue {
 				for i, element := range e.Elts {
-					elements[i] = c.translateImplicitConversion(element, t.Field(i).Type()).String()
+					elements[i] = c.translateImplicitConversionWithCloning(element, t.Field(i).Type()).String()
 				}
 			}
 			if isKeyValue {
@@ -132,7 +178,7 @@ func (c *funcContext) translateExpr(expr ast.Expr) *expression {
 					kve := element.(*ast.KeyValueExpr)
 					for j := range elements {
 						if kve.Key.(*ast.Ident).Name == t.Field(j).Name() {
-							elements[j] = c.translateImplicitConversion(kve.Value, t.Field(j).Type()).String()
+							elements[j] = c.translateImplicitConversionWithCloning(kve.Value, t.Field(j).Type()).String()
 							break
 						}
 					}
@@ -145,7 +191,7 @@ func (c *funcContext) translateExpr(expr ast.Expr) *expression {
 
 	case *ast.FuncLit:
 		innerContext := c.p.analyzeFunction(exprType.(*types.Signature), e.Body)
-		params, body := innerContext.translateFunction(e.Type, e.Body.List, c.allVars)
+		params, body := innerContext.translateFunction(e.Type, e.Body.List, c)
 		if len(c.p.escapingVars) != 0 {
 			names := make([]string, 0, len(c.p.escapingVars))
 			for obj := range c.p.escapingVars {
@@ -181,6 +227,8 @@ func (c *funcContext) translateExpr(expr ast.Expr) *expression {
 			case *ast.IndexExpr:
 				newIndex := &ast.IndexExpr{X: c.newIdent("this.$target", c.p.info.Types[x.X].Type), Index: x.Index}
 				return c.formatExpr("new %s(function() { return %e; }, function($v) { %s }, %e)", c.typeName(exprType), newIndex, c.translateAssign(newIndex, "$v", exprType, false), x.X)
+			case *ast.StarExpr:
+				return c.translateExpr(x.X)
 			default:
 				panic(fmt.Sprintf("Unhandled: %T\n", x))
 			}
@@ -313,9 +361,9 @@ func (c *funcContext) translateExpr(expr ast.Expr) *expression {
 				return c.formatExpr("%e %t %e", e.X, e.Op, e.Y)
 			case token.MUL:
 				switch basic.Kind() {
-				case types.Int32, types.Int:
+				case types.Int32:
 					return c.formatParenExpr("(((%1e >>> 16 << 16) * %2e >> 0) + (%1e << 16 >>> 16) * %2e) >> 0", e.X, e.Y)
-				case types.Uint32, types.Uint, types.Uintptr:
+				case types.Uint32, types.Uintptr:
 					return c.formatParenExpr("(((%1e >>> 16 << 16) * %2e >>> 0) + (%1e << 16 >>> 16) * %2e) >>> 0", e.X, e.Y)
 				case types.Float32, types.Float64:
 					return c.formatExpr("%e * %e", e.X, e.Y)
@@ -388,15 +436,6 @@ func (c *funcContext) translateExpr(expr ast.Expr) *expression {
 				}
 				return c.formatExpr("$interfaceIsEqual(%s, %s)", c.translateImplicitConversion(e.X, t), c.translateImplicitConversion(e.Y, t))
 			case *types.Pointer:
-				xUnary, xIsUnary := e.X.(*ast.UnaryExpr)
-				yUnary, yIsUnary := e.Y.(*ast.UnaryExpr)
-				if xIsUnary && xUnary.Op == token.AND && yIsUnary && yUnary.Op == token.AND {
-					xIndex, xIsIndex := xUnary.X.(*ast.IndexExpr)
-					yIndex, yIsIndex := yUnary.X.(*ast.IndexExpr)
-					if xIsIndex && yIsIndex {
-						return c.formatExpr("$sliceIsEqual(%e, %f, %e, %f)", xIndex.X, xIndex.Index, yIndex.X, yIndex.Index)
-					}
-				}
 				switch u.Elem().Underlying().(type) {
 				case *types.Struct, *types.Interface:
 					return c.formatExpr("%s === %s", c.translateImplicitConversion(e.X, t), c.translateImplicitConversion(e.Y, t))
@@ -479,28 +518,6 @@ func (c *funcContext) translateExpr(expr ast.Expr) *expression {
 		sel, ok := c.p.info.Selections[e]
 		if !ok {
 			// qualified identifier
-			obj := c.p.info.Uses[e.Sel]
-			if isJsPackage(obj.Pkg()) {
-				switch obj.Name() {
-				case "Global":
-					return c.formatExpr("$global")
-				case "This":
-					if len(c.flattened) != 0 {
-						return c.formatExpr("$this")
-					}
-					return c.formatExpr("this")
-				case "Arguments":
-					args := "arguments"
-					if len(c.flattened) != 0 {
-						args = "$args"
-					}
-					return c.formatExpr(`new ($sliceType(%s.Object))($global.Array.prototype.slice.call(%s, []))`, c.p.pkgVars["github.com/gopherjs/gopherjs/js"], args)
-				case "Module":
-					return c.formatExpr("$module")
-				default:
-					panic("Invalid js package object: " + obj.Name())
-				}
-			}
 			return c.formatExpr("%s", c.objectName(obj))
 		}
 
@@ -515,17 +532,11 @@ func (c *funcContext) translateExpr(expr ast.Expr) *expression {
 			}
 			return c.formatExpr("%e.%s", e.X, strings.Join(fields, "."))
 		case types.MethodVal:
-			if !sel.Obj().Exported() {
-				c.p.dependencies[sel.Obj()] = true
-			}
-			recv := c.translateExpr(e.X)
-			if isWrapped(sel.Recv()) {
-				recv = c.formatParenExpr("new %s(%s)", c.typeName(sel.Recv()), recv)
-			}
+			recv := c.makeReceiver(e.X, sel)
 			return c.formatExpr(`$methodVal(%s, "%s")`, recv, sel.Obj().(*types.Func).Name())
 		case types.MethodExpr:
 			if !sel.Obj().Exported() {
-				c.p.dependencies[sel.Obj()] = true
+				c.p.dependencies[qualifiedName(sel.Obj())+"~"] = true
 			}
 			return c.formatExpr("$methodExpr(%s.prototype.%s)", c.typeName(sel.Recv()), sel.Obj().(*types.Func).Name())
 		}
@@ -580,6 +591,8 @@ func (c *funcContext) translateExpr(expr ast.Expr) *expression {
 				obj := c.p.info.Uses[f.Sel]
 				if isJsPackage(obj.Pkg()) {
 					switch obj.Name() {
+					case "Debugger":
+						return c.formatExpr("debugger")
 					case "InternalObject":
 						return c.translateExpr(e.Args[0])
 					}
@@ -605,35 +618,7 @@ func (c *funcContext) translateExpr(expr ast.Expr) *expression {
 
 			switch sel.Kind() {
 			case types.MethodVal:
-				if !sel.Obj().Exported() {
-					c.p.dependencies[sel.Obj()] = true
-				}
-
-				methodName := sel.Obj().Name()
-				if reservedKeywords[methodName] {
-					methodName += "$"
-				}
-
-				recvType := sel.Recv()
-				_, isPointer := recvType.Underlying().(*types.Pointer)
-				methodsRecvType := sel.Obj().Type().(*types.Signature).Recv().Type()
-				_, pointerExpected := methodsRecvType.(*types.Pointer)
-				var recv *expression
-				switch {
-				case !isPointer && pointerExpected:
-					recv = c.translateExpr(c.setType(&ast.UnaryExpr{Op: token.AND, X: f.X}, methodsRecvType))
-				default:
-					recv = c.translateExpr(f.X)
-				}
-
-				for _, index := range sel.Index()[:len(sel.Index())-1] {
-					if ptr, isPtr := recvType.(*types.Pointer); isPtr {
-						recvType = ptr.Elem()
-					}
-					s := recvType.Underlying().(*types.Struct)
-					recv = c.formatExpr("%s.%s", recv, fieldName(s, index))
-					recvType = s.Field(index).Type()
-				}
+				recv := c.makeReceiver(f.X, sel)
 
 				if isJsPackage(sel.Obj().Pkg()) {
 					globalRef := func(id string) string {
@@ -700,18 +685,14 @@ func (c *funcContext) translateExpr(expr ast.Expr) *expression {
 						return c.internalize(recv, types.NewInterface(nil, nil))
 					case "Unsafe":
 						return recv
-					case "IsUndefined":
-						return c.formatParenExpr("%s === undefined", recv)
-					case "IsNull":
-						return c.formatParenExpr("%s === null", recv)
 					default:
 						panic("Invalid js package object: " + sel.Obj().Name())
 					}
 				}
 
-				if isWrapped(methodsRecvType) {
-					fun = c.formatExpr("(new %s(%s)).%s", c.typeName(methodsRecvType), recv, methodName)
-					break
+				methodName := sel.Obj().Name()
+				if reservedKeywords[methodName] {
+					methodName += "$"
 				}
 				fun = c.formatExpr("%s.%s", recv, methodName)
 
@@ -734,17 +715,7 @@ func (c *funcContext) translateExpr(expr ast.Expr) *expression {
 		}
 
 		sig := c.p.info.Types[plainFun].Type.Underlying().(*types.Signature)
-		if len(e.Args) == 1 {
-			if tuple, isTuple := c.p.info.Types[e.Args[0]].Type.(*types.Tuple); isTuple {
-				tupleVar := c.newVariable("_tuple")
-				args := make([]ast.Expr, tuple.Len())
-				for i := range args {
-					args[i] = c.newIdent(c.formatExpr("%s[%d]", tupleVar, i).String(), tuple.At(i).Type())
-				}
-				return c.formatExpr("(%s = %e, %s(%s))", tupleVar, e.Args[0], fun, strings.Join(c.translateArgs(sig, args, false), ", "))
-			}
-		}
-		args := c.translateArgs(sig, e.Args, e.Ellipsis.IsValid())
+		args := c.translateArgs(sig, e.Args, e.Ellipsis.IsValid(), false)
 		if c.blocking[e] {
 			resumeCase := c.caseCounter
 			c.caseCounter++
@@ -752,7 +723,7 @@ func (c *funcContext) translateExpr(expr ast.Expr) *expression {
 			if sig.Results().Len() != 0 {
 				returnVar = c.newVariable("_r")
 			}
-			c.Printf("%[1]s = %[2]s(%[3]s); /* */ $s = %[4]d; case %[4]d: if (%[1]s && %[1]s.$blocking) { %[1]s = %[1]s(); }", returnVar, fun, strings.Join(append(args, "true"), ", "), resumeCase)
+			c.Printf("%[1]s = %[2]s(%[3]s); /* */ $s = %[4]d; case %[4]d: if (%[1]s && %[1]s.$blocking) { %[1]s = %[1]s(); }", returnVar, fun, strings.Join(append(args, "$BLOCKING"), ", "), resumeCase)
 			if sig.Results().Len() != 0 {
 				return c.formatExpr("%s", returnVar)
 			}
@@ -788,10 +759,6 @@ func (c *funcContext) translateExpr(expr ast.Expr) *expression {
 		if e.Name == "_" {
 			panic("Tried to translate underscore identifier.")
 		}
-		obj := c.p.info.Defs[e]
-		if obj == nil {
-			obj = c.p.info.Uses[e]
-		}
 		switch o := obj.(type) {
 		case *types.PkgName:
 			return c.formatExpr("%s", c.p.pkgVars[o.Imported().Path()])
@@ -807,7 +774,7 @@ func (c *funcContext) translateExpr(expr ast.Expr) *expression {
 			panic(fmt.Sprintf("Unhandled object: %T\n", o))
 		}
 
-	case *This:
+	case *this:
 		this := "this"
 		if len(c.flattened) != 0 {
 			this = "$this"
@@ -824,6 +791,39 @@ func (c *funcContext) translateExpr(expr ast.Expr) *expression {
 		panic(fmt.Sprintf("Unhandled expression: %T\n", e))
 
 	}
+}
+
+func (c *funcContext) makeReceiver(x ast.Expr, sel *types.Selection) *expression {
+	if !sel.Obj().Exported() {
+		c.p.dependencies[qualifiedName(sel.Obj())+"~"] = true
+	}
+
+	recvType := sel.Recv()
+	_, isPointer := recvType.Underlying().(*types.Pointer)
+	methodsRecvType := sel.Obj().Type().(*types.Signature).Recv().Type()
+	_, pointerExpected := methodsRecvType.(*types.Pointer)
+	var recv *expression
+	switch {
+	case !isPointer && pointerExpected:
+		recv = c.translateExpr(c.setType(&ast.UnaryExpr{Op: token.AND, X: x}, methodsRecvType))
+	default:
+		recv = c.translateExpr(x)
+	}
+
+	for _, index := range sel.Index()[:len(sel.Index())-1] {
+		if ptr, isPtr := recvType.(*types.Pointer); isPtr {
+			recvType = ptr.Elem()
+		}
+		s := recvType.Underlying().(*types.Struct)
+		recv = c.formatExpr("%s.%s", recv, fieldName(s, index))
+		recvType = s.Field(index).Type()
+	}
+
+	if isWrapped(methodsRecvType) {
+		recv = c.formatExpr("new %s(%s)", c.typeName(methodsRecvType), recv)
+	}
+
+	return recv
 }
 
 func (c *funcContext) translateBuiltin(name string, args []ast.Expr, ellipsis bool, typ types.Type) *expression {
@@ -1166,7 +1166,7 @@ func (c *funcContext) loadStruct(array, target string, s *types.Struct) string {
 				code += fmt.Sprintf(", %s = %s.get%s(%d, true)", field.Name(), view, toJavaScriptType(t), offsets[i])
 			}
 		case *types.Array:
-			code += fmt.Sprintf(`, %s = new ($nativeArray("%s"))(%s.buffer, $min(%s.byteOffset + %d, %s.buffer.byteLength))`, field.Name(), typeKind(t.Elem()), array, array, offsets[i], array)
+			code += fmt.Sprintf(`, %s = new ($nativeArray(%s))(%s.buffer, $min(%s.byteOffset + %d, %s.buffer.byteLength))`, field.Name(), typeKind(t.Elem()), array, array, offsets[i], array)
 		}
 	}
 	return code

@@ -3,26 +3,29 @@
 package syscall
 
 import (
-	"github.com/gopherjs/gopherjs/js"
 	"unsafe"
+
+	"github.com/gopherjs/gopherjs/js"
 )
 
-func init() {
+func runtime_envs() []string {
 	process := js.Global.Get("process")
-	if !process.IsUndefined() {
-		jsEnv := process.Get("env")
-		envkeys := js.Global.Get("Object").Call("keys", jsEnv)
-		envs = make([]string, envkeys.Length())
-		for i := 0; i < envkeys.Length(); i++ {
-			key := envkeys.Index(i).Str()
-			envs[i] = key + "=" + jsEnv.Get(key).Str()
-		}
+	if process == js.Undefined {
+		return nil
 	}
+	jsEnv := process.Get("env")
+	envkeys := js.Global.Get("Object").Call("keys", jsEnv)
+	envs := make([]string, envkeys.Length())
+	for i := 0; i < envkeys.Length(); i++ {
+		key := envkeys.Index(i).Str()
+		envs[i] = key + "=" + jsEnv.Get(key).Str()
+	}
+	return envs
 }
 
 func setenv_c(k, v string) {
 	process := js.Global.Get("process")
-	if !process.IsUndefined() {
+	if process != js.Undefined {
 		process.Get("env").Set(k, v)
 	}
 }
@@ -42,7 +45,7 @@ func syscall(name string) js.Object {
 		}
 		alreadyTriedToLoad = true
 		require := js.Global.Get("require")
-		if require.IsUndefined() {
+		if require == js.Undefined {
 			panic("")
 		}
 		syscallModule = require.Invoke("syscall")

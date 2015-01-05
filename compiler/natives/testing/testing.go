@@ -2,69 +2,22 @@
 
 package testing
 
-import (
-	"flag"
-	"fmt"
-	"os"
-	"runtime"
-	"time"
-)
+import "runtime"
 
-func init() {
-	x := false
-	if x { // avoid dead code elimination
-		Main(nil, nil, nil, nil)
-	}
+type InternalTest struct {
+	Name string
+	F2   func(*T)
 }
 
-func Main(matchString func(pat, str string) (bool, error), tests []InternalTest, benchmarks []InternalBenchmark, examples []InternalExample) {
-	flag.Parse()
-	if len(tests) == 0 {
-		fmt.Println("testing: warning: no tests to run")
-	}
-
-	failed := false
-	for _, test := range tests {
-		t := &T{
-			common: common{
-				start: time.Now(),
-			},
-			name: test.Name,
-		}
-		t.self = t
-		if *chatty {
-			fmt.Printf("=== RUN %s\n", t.name)
-		}
-
-		done := make(chan struct{})
-		var err interface{}
-		go func() {
-			defer func() {
-				err = recover()
-				close(done)
-			}()
-			test.F(t) //gopherjs:blocking
-		}()
-		<-done
-
-		t.common.duration = time.Now().Sub(t.common.start)
+func (test *InternalTest) F(t *T) {
+	defer func() {
+		err := recover()
 		if e, ok := err.(*runtime.NotSupportedError); ok {
-			t.log(e.Error())
-			t.skip()
-			err = nil
+			t.Skip(e)
 		}
-		if err != nil {
-			t.Fail()
-		}
-		t.report()
 		if err != nil {
 			panic(err)
 		}
-		failed = failed || t.common.failed
-	}
-
-	if failed {
-		os.Exit(1)
-	}
-	os.Exit(0)
+	}()
+	test.F2(t) //gopherjs:blocking
 }

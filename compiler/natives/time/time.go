@@ -3,15 +3,16 @@
 package time
 
 import (
-	"github.com/gopherjs/gopherjs/js"
 	"strings"
+
+	"github.com/gopherjs/gopherjs/js"
 )
 
 type runtimeTimer struct {
 	i       int32
 	when    int64
 	period  int64
-	f       func(int64, interface{})
+	f       func(interface{}, uintptr)
 	arg     interface{}
 	timeout js.Object
 	active  bool
@@ -56,12 +57,12 @@ func startTimer(t *runtimeTimer) {
 	}
 	t.timeout = js.Global.Call("setTimeout", func() {
 		t.active = false
-		t.f(runtimeNano(), t.arg)
+		t.f(t.arg, 0)
 		if t.period != 0 {
 			t.when += t.period
 			startTimer(t)
 		}
-	}, diff)
+	}, diff+1)
 }
 
 func stopTimer(t *runtimeTimer) bool {

@@ -2,14 +2,15 @@ package compiler
 
 import (
 	"bytes"
-	"code.google.com/p/go.tools/go/exact"
-	"code.google.com/p/go.tools/go/types"
 	"encoding/binary"
 	"fmt"
 	"go/ast"
 	"go/token"
 	"strconv"
 	"strings"
+
+	"golang.org/x/tools/go/exact"
+	"golang.org/x/tools/go/types"
 )
 
 func (c *funcContext) Write(b []byte) (int, error) {
@@ -59,7 +60,18 @@ func (c *funcContext) Delayed(f func()) {
 	c.delayedOutput = c.CatchOutput(0, f)
 }
 
-func (c *funcContext) translateArgs(sig *types.Signature, args []ast.Expr, ellipsis bool) []string {
+func (c *funcContext) translateArgs(sig *types.Signature, args []ast.Expr, ellipsis, clone bool) []string {
+	if len(args) == 1 {
+		if tuple, isTuple := c.p.info.Types[args[0]].Type.(*types.Tuple); isTuple {
+			tupleVar := c.newVariable("_tuple")
+			c.Printf("%s = %s;", tupleVar, c.translateExpr(args[0]))
+			args = make([]ast.Expr, tuple.Len())
+			for i := range args {
+				args[i] = c.newIdent(c.formatExpr("%s[%d]", tupleVar, i).String(), tuple.At(i).Type())
+			}
+		}
+	}
+
 	params := make([]string, sig.Params().Len())
 	for i := range params {
 		if sig.Variadic() && i == len(params)-1 && !ellipsis {
@@ -72,7 +84,11 @@ func (c *funcContext) translateArgs(sig *types.Signature, args []ast.Expr, ellip
 			break
 		}
 		argType := sig.Params().At(i).Type()
-		params[i] = c.translateImplicitConversionWithCloning(args[i], argType).String()
+		if clone {
+			params[i] = c.translateImplicitConversionWithCloning(args[i], argType).String()
+			continue
+		}
+		params[i] = c.translateImplicitConversion(args[i], argType).String()
 	}
 	return params
 }
@@ -143,6 +159,9 @@ func (c *funcContext) zeroValue(ty types.Type) string {
 	case *types.Map:
 		return "false"
 	case *types.Interface:
+		if isJsObject(ty) {
+			return "null"
+		}
 		return "$ifaceNil"
 	}
 	return fmt.Sprintf("%s.nil", c.typeName(ty))
@@ -189,15 +208,24 @@ func (c *funcContext) newVariableWithLevel(name string, pkgLevel bool, initializ
 	}
 	n := c.allVars[name]
 	c.allVars[name] = n + 1
+	varName := name
 	if n > 0 {
-		name = fmt.Sprintf("%s$%d", name, n)
+		varName = fmt.Sprintf("%s$%d", name, n)
 	}
+
+	if pkgLevel {
+		for c2 := c.parent; c2 != nil; c2 = c2.parent {
+			c2.allVars[name] = n + 1
+		}
+		return varName
+	}
+
 	if initializer != "" {
-		c.localVars = append(c.localVars, name+" = "+initializer)
-		return name
+		c.localVars = append(c.localVars, varName+" = "+initializer)
+		return varName
 	}
-	c.localVars = append(c.localVars, name)
-	return name
+	c.localVars = append(c.localVars, varName)
+	return varName
 }
 
 func (c *funcContext) newIdent(name string, t types.Type) *ast.Ident {
@@ -222,7 +250,7 @@ func (c *funcContext) setType(e ast.Expr, t types.Type) ast.Expr {
 
 func (c *funcContext) objectName(o types.Object) string {
 	if o.Pkg() != c.p.pkg || o.Parent() == c.p.pkg.Scope() {
-		c.p.dependencies[o] = true
+		c.p.dependencies[qualifiedName(o)] = true
 	}
 
 	if o.Pkg() != c.p.pkg {
@@ -255,34 +283,32 @@ func (c *funcContext) objectName(o types.Object) string {
 func (c *funcContext) typeName(ty types.Type) string {
 	switch t := ty.(type) {
 	case *types.Basic:
-		switch t.Kind() {
-		case types.UnsafePointer:
-			return "$UnsafePointer"
-		default:
-			return "$" + toJavaScriptType(t)
-		}
+		return "$" + toJavaScriptType(t)
 	case *types.Named:
 		if t.Obj().Name() == "error" {
 			return "$error"
 		}
 		return c.objectName(t.Obj())
-	case *types.Pointer:
-		return fmt.Sprintf("($ptrType(%s))", c.initArgs(t))
 	case *types.Interface:
 		if t.Empty() {
 			return "$emptyInterface"
 		}
-		return fmt.Sprintf("($interfaceType(%s))", c.initArgs(t))
-	case *types.Array, *types.Chan, *types.Slice, *types.Map, *types.Signature, *types.Struct:
-		return fmt.Sprintf("($%sType(%s))", strings.ToLower(typeKind(t)), c.initArgs(t))
-	default:
-		panic(fmt.Sprintf("Unhandled type: %T\n", t))
 	}
+
+	name, ok := c.p.anonTypeVars[ty.String()]
+	if !ok {
+		c.initArgs(ty) // cause all embedded types to be registered
+		c.p.anonTypes = append(c.p.anonTypes, ty)
+		name = c.newVariableWithLevel(strings.ToLower(typeKind(ty)[5:])+"Type", true, "")
+		c.p.anonTypeVars[ty.String()] = name
+	}
+	c.p.dependencies[c.p.pkg.Path()+":"+ty.String()] = true
+	return name
 }
 
 func (c *funcContext) makeKey(expr ast.Expr, keyType types.Type) string {
 	switch t := keyType.Underlying().(type) {
-	case *types.Array:
+	case *types.Array, *types.Struct:
 		return fmt.Sprintf("(new %s(%s)).$key()", c.typeName(keyType), c.translateExpr(expr))
 	case *types.Basic:
 		if is64Bit(t) {
@@ -326,23 +352,23 @@ func fieldName(t *types.Struct, i int) string {
 func typeKind(ty types.Type) string {
 	switch t := ty.Underlying().(type) {
 	case *types.Basic:
-		return toJavaScriptType(t)
+		return "$kind" + toJavaScriptType(t)
 	case *types.Array:
-		return "Array"
+		return "$kindArray"
 	case *types.Chan:
-		return "Chan"
+		return "$kindChan"
 	case *types.Interface:
-		return "Interface"
+		return "$kindInterface"
 	case *types.Map:
-		return "Map"
+		return "$kindMap"
 	case *types.Signature:
-		return "Func"
+		return "$kindFunc"
 	case *types.Slice:
-		return "Slice"
+		return "$kindSlice"
 	case *types.Struct:
-		return "Struct"
+		return "$kindStruct"
 	case *types.Pointer:
-		return "Ptr"
+		return "$kindPtr"
 	default:
 		panic(fmt.Sprintf("Unhandled type: %T\n", t))
 	}
@@ -539,4 +565,8 @@ func removeWhitespace(b []byte, minify bool) []byte {
 		b = b[1:]
 	}
 	return out
+}
+
+func qualifiedName(o types.Object) string {
+	return o.Pkg().Path() + "." + o.Name()
 }

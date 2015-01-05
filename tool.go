@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"flag"
 	"fmt"
 	"go/ast"
 	"go/build"
@@ -18,9 +17,12 @@ import (
 	"text/template"
 	"time"
 
-	"code.google.com/p/go.tools/go/types"
 	gbuild "github.com/gopherjs/gopherjs/build"
 	"github.com/gopherjs/gopherjs/compiler"
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
+	"golang.org/x/crypto/ssh/terminal"
+	"golang.org/x/tools/go/types"
 )
 
 var currentDirectory string
@@ -40,67 +42,66 @@ func init() {
 }
 
 func main() {
-	flags := flag.NewFlagSet("", flag.ContinueOnError)
-	cmd := "help"
-	var cmdArgs []string
-	if err := flags.Parse(os.Args[1:]); err == nil && flags.NArg() != 0 {
-		cmd = flags.Arg(0)
-		cmdArgs = flags.Args()[1:]
-		if cmd == "help" && flags.NArg() == 2 {
-			cmd = flags.Arg(1)
-			cmdArgs = []string{"--help"}
-		}
-	}
-
 	options := &gbuild.Options{CreateMapFile: true}
-	switch cmd {
-	case "build":
-		buildFlags := flag.NewFlagSet("build command", flag.ExitOnError)
-		var pkgObj string
-		buildFlags.StringVar(&pkgObj, "o", "", "output file")
-		buildFlags.BoolVar(&options.Verbose, "v", false, "print the names of packages as they are compiled")
-		buildFlags.BoolVar(&options.Watch, "w", false, "watch for changes to the source files")
-		buildFlags.BoolVar(&options.Minify, "m", false, "minify generated code")
-		buildFlags.Parse(cmdArgs)
+	var pkgObj string
 
+	pflag.BoolVarP(&options.Verbose, "verbose", "v", false, "print the names of packages as they are compiled")
+	flagVerbose := pflag.Lookup("verbose")
+	pflag.BoolVarP(&options.Watch, "watch", "w", false, "watch for changes to the source files")
+	flagWatch := pflag.Lookup("watch")
+	pflag.BoolVarP(&options.Minify, "minify", "m", false, "minify generated code")
+	flagMinify := pflag.Lookup("minify")
+	pflag.BoolVar(&options.Color, "color", terminal.IsTerminal(2) && os.Getenv("TERM") != "dumb", "colored output")
+	flagColor := pflag.Lookup("color")
+
+	cmdBuild := &cobra.Command{
+		Use:   "build [packages]",
+		Short: "compile packages and dependencies",
+	}
+	cmdBuild.Flags().StringVarP(&pkgObj, "output", "o", "", "output file")
+	cmdBuild.Flags().AddFlag(flagVerbose)
+	cmdBuild.Flags().AddFlag(flagWatch)
+	cmdBuild.Flags().AddFlag(flagMinify)
+	cmdBuild.Flags().AddFlag(flagColor)
+	cmdBuild.Run = func(cmd *cobra.Command, args []string) {
 		for {
 			s := gbuild.NewSession(options)
 
 			exitCode := handleError(func() error {
-				if buildFlags.NArg() == 0 {
+				if len(args) == 0 {
 					return s.BuildDir(currentDirectory, currentDirectory, pkgObj)
 				}
 
-				if strings.HasSuffix(buildFlags.Arg(0), ".go") {
-					for _, arg := range buildFlags.Args() {
-						if !strings.HasSuffix(arg, ".go") {
-							return fmt.Errorf("named files must be .go files")
+				if strings.HasSuffix(args[0], ".go") || strings.HasSuffix(args[0], ".inc.js") {
+					for _, arg := range args {
+						if !strings.HasSuffix(arg, ".go") && !strings.HasSuffix(arg, ".inc.js") {
+							return fmt.Errorf("named files must be .go or .inc.js files")
 						}
 					}
 					if pkgObj == "" {
-						basename := filepath.Base(buildFlags.Arg(0))
+						basename := filepath.Base(args[0])
 						pkgObj = basename[:len(basename)-3] + ".js"
 					}
-					names := make([]string, buildFlags.NArg())
-					for i, name := range buildFlags.Args() {
+					names := make([]string, len(args))
+					for i, name := range args {
 						name = filepath.ToSlash(name)
 						names[i] = name
 						if s.Watcher != nil {
 							s.Watcher.Add(filepath.ToSlash(name))
 						}
 					}
-					if err := s.BuildFiles(buildFlags.Args(), pkgObj, currentDirectory); err != nil {
+					if err := s.BuildFiles(args, pkgObj, currentDirectory); err != nil {
 						return err
 					}
 					return nil
 				}
 
-				for _, pkgPath := range buildFlags.Args() {
+				for _, pkgPath := range args {
 					pkgPath = filepath.ToSlash(pkgPath)
 					if s.Watcher != nil {
 						s.Watcher.Add(pkgPath)
 					}
-					buildPkg, err := gbuild.Import(pkgPath, 0, s.ArchSuffix())
+					buildPkg, err := gbuild.Import(pkgPath, 0, s.InstallSuffix())
 					if err != nil {
 						return err
 					}
@@ -109,33 +110,36 @@ func main() {
 						return err
 					}
 					if pkgObj == "" {
-						pkgObj = filepath.Base(buildFlags.Arg(0)) + ".js"
+						pkgObj = filepath.Base(args[0]) + ".js"
 					}
 					if err := s.WriteCommandPackage(pkg, pkgObj); err != nil {
 						return err
 					}
 				}
 				return nil
-			})
+			}, options)
 
 			if s.Watcher == nil {
 				os.Exit(exitCode)
 			}
 			s.WaitForChange()
 		}
+	}
 
-	case "install", "get":
-		installFlags := flag.NewFlagSet("install command", flag.ExitOnError)
-		installFlags.BoolVar(&options.Verbose, "v", false, "print the names of packages as they are compiled")
-		installFlags.BoolVar(&options.Watch, "w", false, "watch for changes to the source files")
-		installFlags.BoolVar(&options.Minify, "m", false, "minify generated code")
-		installFlags.Parse(cmdArgs)
-
+	cmdInstall := &cobra.Command{
+		Use:   "install [packages]",
+		Short: "compile and install packages and dependencies",
+	}
+	cmdInstall.Flags().AddFlag(flagVerbose)
+	cmdInstall.Flags().AddFlag(flagWatch)
+	cmdInstall.Flags().AddFlag(flagMinify)
+	cmdInstall.Flags().AddFlag(flagColor)
+	cmdInstall.Run = func(cmd *cobra.Command, args []string) {
 		for {
 			s := gbuild.NewSession(options)
 
 			exitCode := handleError(func() error {
-				pkgs := installFlags.Args()
+				pkgs := args
 				if len(pkgs) == 0 {
 					firstGopathWorkspace := filepath.SplitList(build.Default.GOPATH)[0] // TODO: The GOPATH workspace that contains the package source should be chosen.
 					srcDir, err := filepath.EvalSymlinks(filepath.Join(firstGopathWorkspace, "src"))
@@ -151,8 +155,11 @@ func main() {
 					}
 					pkgs = []string{pkgPath}
 				}
-				if cmd == "get" {
-					if err := exec.Command("go", append([]string{"get", "-d"}, pkgs...)...).Run(); err != nil {
+				if cmd.Name() == "get" {
+					goGet := exec.Command("go", append([]string{"get", "-d"}, pkgs...)...)
+					goGet.Stdout = os.Stdout
+					goGet.Stderr = os.Stderr
+					if err := goGet.Run(); err != nil {
 						return err
 					}
 				}
@@ -167,22 +174,34 @@ func main() {
 					}
 				}
 				return nil
-			})
+			}, options)
 
 			if s.Watcher == nil {
 				os.Exit(exitCode)
 			}
 			s.WaitForChange()
 		}
+	}
 
-	case "run":
-		runFlags := flag.NewFlagSet("run command", flag.ExitOnError)
-		runFlags.Parse(cmdArgs)
+	cmdGet := &cobra.Command{
+		Use:   "get [packages]",
+		Short: "download and install packages and dependencies",
+	}
+	cmdGet.Flags().AddFlag(flagVerbose)
+	cmdGet.Flags().AddFlag(flagWatch)
+	cmdGet.Flags().AddFlag(flagMinify)
+	cmdGet.Flags().AddFlag(flagColor)
+	cmdGet.Run = cmdInstall.Run
 
+	cmdRun := &cobra.Command{
+		Use:   "run [gofiles...] [arguments...]",
+		Short: "compile and run Go program",
+	}
+	cmdRun.Run = func(cmd *cobra.Command, args []string) {
 		os.Exit(handleError(func() error {
 			lastSourceArg := 0
 			for {
-				if !strings.HasSuffix(runFlags.Arg(lastSourceArg), ".go") {
+				if lastSourceArg == len(args) || !(strings.HasSuffix(args[lastSourceArg], ".go") || strings.HasSuffix(args[lastSourceArg], ".inc.js")) {
 					break
 				}
 				lastSourceArg++
@@ -191,7 +210,7 @@ func main() {
 				return fmt.Errorf("gopherjs run: no go files listed")
 			}
 
-			tempfile, err := ioutil.TempFile("", filepath.Base(runFlags.Arg(0))+".")
+			tempfile, err := ioutil.TempFile("", filepath.Base(args[0])+".")
 			if err != nil {
 				return err
 			}
@@ -200,34 +219,39 @@ func main() {
 				os.Remove(tempfile.Name())
 			}()
 			s := gbuild.NewSession(options)
-			if err := s.BuildFiles(runFlags.Args()[:lastSourceArg], tempfile.Name(), currentDirectory); err != nil {
+			if err := s.BuildFiles(args[:lastSourceArg], tempfile.Name(), currentDirectory); err != nil {
 				return err
 			}
-			if err := runNode(tempfile.Name(), runFlags.Args()[lastSourceArg:], ""); err != nil {
+			if err := runNode(tempfile.Name(), args[lastSourceArg:], ""); err != nil {
 				return err
 			}
 			return nil
-		}))
+		}, options))
+	}
 
-	case "test":
-		testFlags := flag.NewFlagSet("test command", flag.ExitOnError)
-		verbose := testFlags.Bool("v", false, "verbose")
-		short := testFlags.Bool("short", false, "short")
-		testFlags.BoolVar(&options.Minify, "m", false, "minify generated code")
-		testFlags.Parse(cmdArgs)
-
+	cmdTest := &cobra.Command{
+		Use:   "test [packages]",
+		Short: "test packages",
+	}
+	bench := cmdTest.Flags().String("bench", "", "Run benchmarks matching the regular expression. By default, no benchmarks run. To run all benchmarks, use '--bench=.'.")
+	run := cmdTest.Flags().String("run", "", "Run only those tests and examples matching the regular expression.")
+	short := cmdTest.Flags().Bool("short", false, "Tell long-running tests to shorten their run time.")
+	verbose := cmdTest.Flags().BoolP("verbose", "v", false, "Log all tests as they are run. Also print all text from Log and Logf calls even if the test succeeds.")
+	cmdTest.Flags().AddFlag(flagMinify)
+	cmdTest.Flags().AddFlag(flagColor)
+	cmdTest.Run = func(cmd *cobra.Command, args []string) {
 		os.Exit(handleError(func() error {
-			pkgs := make([]*build.Package, testFlags.NArg())
-			for i, pkgPath := range testFlags.Args() {
+			pkgs := make([]*build.Package, len(args))
+			for i, pkgPath := range args {
 				pkgPath = filepath.ToSlash(pkgPath)
 				var err error
-				pkgs[i], err = gbuild.Import(pkgPath, 0, "js")
+				pkgs[i], err = gbuild.Import(pkgPath, 0, "")
 				if err != nil {
 					return err
 				}
 			}
 			if len(pkgs) == 0 {
-				firstGopathWorkspace := filepath.SplitList(build.Default.GOPATH)[0] // TODO: Not sure if always picking first GOPATH workspace here is the right thing.
+				firstGopathWorkspace := filepath.SplitList(build.Default.GOPATH)[0]
 				srcDir, err := filepath.EvalSymlinks(filepath.Join(firstGopathWorkspace, "src"))
 				if err != nil {
 					return err
@@ -238,7 +262,7 @@ func main() {
 					if err != nil {
 						return err
 					}
-					if pkg, err = gbuild.Import(pkgPath, 0, "js"); err != nil {
+					if pkg, err = gbuild.Import(pkgPath, 0, ""); err != nil {
 						return err
 					}
 				}
@@ -252,45 +276,53 @@ func main() {
 			}
 
 			var exitErr error
-			for _, buildPkg := range pkgs {
-				if len(buildPkg.TestGoFiles) == 0 && len(buildPkg.XTestGoFiles) == 0 {
-					fmt.Printf("?   \t%s\t[no test files]\n", buildPkg.ImportPath)
+			for _, pkg := range pkgs {
+				if len(pkg.TestGoFiles) == 0 && len(pkg.XTestGoFiles) == 0 {
+					fmt.Printf("?   \t%s\t[no test files]\n", pkg.ImportPath)
 					continue
 				}
 
-				buildPkg.PkgObj = ""
-				buildPkg.GoFiles = append(buildPkg.GoFiles, buildPkg.TestGoFiles...)
-				pkg := &gbuild.PackageData{Package: buildPkg}
-
 				s := gbuild.NewSession(options)
-				if err := s.BuildPackage(pkg); err != nil {
-					return err
-				}
-
-				tests := &testFuncs{Package: buildPkg}
-				collectTests := func(pkg *gbuild.PackageData, testPkg string) bool {
-					for _, name := range pkg.Archive.Tests {
-						tests.Tests = append(tests.Tests, testFunc{Package: testPkg, Name: name})
-					}
-					return len(pkg.Archive.Tests) != 0
-				}
-
-				tests.NeedTest = collectTests(pkg, "_test")
-				if len(pkg.XTestGoFiles) != 0 {
-					testPkg := &gbuild.PackageData{Package: &build.Package{
-						ImportPath: pkg.ImportPath + "_test",
-						Dir:        pkg.Dir,
-						GoFiles:    pkg.XTestGoFiles,
-					}}
+				tests := &testFuncs{Package: pkg}
+				collectTests := func(buildPkg *build.Package, testPkgName string, needVar *bool) error {
+					testPkg := &gbuild.PackageData{Package: buildPkg}
 					if err := s.BuildPackage(testPkg); err != nil {
 						return err
 					}
-					tests.NeedXtest = collectTests(testPkg, "_xtest")
+
+					for _, decl := range testPkg.Archive.Declarations {
+						if strings.HasPrefix(decl.FullName, testPkg.ImportPath+".Test") {
+							tests.Tests = append(tests.Tests, testFunc{Package: testPkgName, Name: decl.FullName[len(testPkg.ImportPath)+1:]})
+							*needVar = true
+						}
+						if strings.HasPrefix(decl.FullName, testPkg.ImportPath+".Benchmark") {
+							tests.Benchmarks = append(tests.Benchmarks, testFunc{Package: testPkgName, Name: decl.FullName[len(testPkg.ImportPath)+1:]})
+							*needVar = true
+						}
+					}
+					return nil
+				}
+
+				if err := collectTests(&build.Package{
+					ImportPath: pkg.ImportPath,
+					Dir:        pkg.Dir,
+					GoFiles:    append(pkg.GoFiles, pkg.TestGoFiles...),
+					Imports:    append(pkg.Imports, pkg.TestImports...),
+				}, "_test", &tests.NeedTest); err != nil {
+					return err
+				}
+
+				if err := collectTests(&build.Package{
+					ImportPath: pkg.ImportPath + "_test",
+					Dir:        pkg.Dir,
+					GoFiles:    pkg.XTestGoFiles,
+					Imports:    pkg.XTestImports,
+				}, "_xtest", &tests.NeedXtest); err != nil {
+					return err
 				}
 
 				buf := bytes.NewBuffer(nil)
-				err := testmainTmpl.Execute(buf, tests)
-				if err != nil {
+				if err := testmainTmpl.Execute(buf, tests); err != nil {
 					return err
 				}
 
@@ -325,107 +357,102 @@ func main() {
 				}
 
 				var args []string
-				if *verbose {
-					args = append(args, "-test.v")
+				if *bench != "" {
+					args = append(args, "-test.bench", *bench)
+				}
+				if *run != "" {
+					args = append(args, "-test.run", *run)
 				}
 				if *short {
 					args = append(args, "-test.short")
 				}
+				if *verbose {
+					args = append(args, "-test.v")
+				}
 				status := "ok  "
 				start := time.Now()
-				if err := runNode(tempfile.Name(), args, buildPkg.Dir); err != nil {
+				if err := runNode(tempfile.Name(), args, pkg.Dir); err != nil {
 					if _, ok := err.(*exec.ExitError); !ok {
 						return err
 					}
 					exitErr = err
 					status = "FAIL"
 				}
-				fmt.Printf("%s\t%s\t%.3fs\n", status, buildPkg.ImportPath, time.Now().Sub(start).Seconds())
+				fmt.Printf("%s\t%s\t%.3fs\n", status, pkg.ImportPath, time.Now().Sub(start).Seconds())
 			}
 			return exitErr
-		}))
+		}, options))
+	}
 
-	case "tool":
-		tool := cmdArgs[0]
-		toolFlags := flag.NewFlagSet("tool command", flag.ExitOnError)
-		toolFlags.Bool("e", false, "")
-		toolFlags.Bool("l", false, "")
-		toolFlags.Bool("m", false, "")
-		toolFlags.String("o", "", "")
-		toolFlags.String("D", "", "")
-		toolFlags.String("I", "", "")
-		toolFlags.Parse(flags.Args()[2:])
-
+	cmdTool := &cobra.Command{
+		Use:   "tool [command] [args...]",
+		Short: "run specified go tool",
+	}
+	cmdTool.Flags().BoolP("e", "e", false, "")
+	cmdTool.Flags().BoolP("l", "l", false, "")
+	cmdTool.Flags().BoolP("m", "m", false, "")
+	cmdTool.Flags().StringP("o", "o", "", "")
+	cmdTool.Flags().StringP("D", "D", "", "")
+	cmdTool.Flags().StringP("I", "I", "", "")
+	cmdTool.Run = func(cmd *cobra.Command, args []string) {
 		os.Exit(handleError(func() error {
-			if len(tool) == 2 {
-				switch tool[1] {
+			if len(args) == 2 {
+				switch args[0][1] {
 				case 'g':
-					basename := filepath.Base(toolFlags.Arg(0))
+					basename := filepath.Base(args[1])
 					s := gbuild.NewSession(options)
-					if err := s.BuildFiles([]string{toolFlags.Arg(0)}, basename[:len(basename)-3]+".js", currentDirectory); err != nil {
+					if err := s.BuildFiles([]string{args[1]}, basename[:len(basename)-3]+".js", currentDirectory); err != nil {
 						return err
 					}
 					return nil
 				}
 			}
-			return fmt.Errorf("Tool not supported: " + tool)
-		}))
-
-	case "help", "":
-		os.Stderr.WriteString(`GopherJS is a tool for compiling Go source code to JavaScript.
-
-Usage:
-
-    gopherjs command [arguments]
-
-The commands are:
-
-    build       compile packages and dependencies
-    install     compile and install packages and dependencies
-    run         compile and run Go program (requires Node.js)
-    test        test packages (requires Node.js)
-
-Use "go help [command]" for more information about a command.
-
-`)
-
-	default:
-		fmt.Fprintf(os.Stderr, "gopherjs: unknown subcommand \"%s\"\nRun 'gopherjs help' for usage.\n", cmd)
-
+			cmdTool.Help()
+			return nil
+		}, options))
 	}
+
+	rootCmd := &cobra.Command{
+		Use:  "gopherjs",
+		Long: "GopherJS is a tool for compiling Go source code to JavaScript.",
+	}
+	rootCmd.AddCommand(cmdBuild, cmdGet, cmdInstall, cmdRun, cmdTest, cmdTool)
+	rootCmd.Execute()
 }
 
-func handleError(f func() error) int {
+func handleError(f func() error, options *gbuild.Options) int {
 	switch err := f().(type) {
 	case nil:
 		return 0
 	case compiler.ErrorList:
-		makeRel := func(name string) string {
-			if relname, err := filepath.Rel(currentDirectory, name); err == nil {
-				if relname[0] != '.' {
-					return "." + string(filepath.Separator) + relname
-				}
-				return relname
-			}
-			return name
-		}
 		for _, entry := range err {
-			switch e := entry.(type) {
-			case *scanner.Error:
-				fmt.Fprintf(os.Stderr, "\x1B[31m%s:%d:%d: %s\x1B[39m\n", makeRel(e.Pos.Filename), e.Pos.Line, e.Pos.Column, e.Msg)
-			case types.Error:
-				pos := e.Fset.Position(e.Pos)
-				fmt.Fprintf(os.Stderr, "\x1B[31m%s:%d:%d: %s\x1B[39m\n", makeRel(pos.Filename), pos.Line, pos.Column, e.Msg)
-			default:
-				fmt.Fprintf(os.Stderr, "\x1B[31m%s\x1B[39m\n", entry)
-			}
+			printError(entry, options)
 		}
 		return 1
 	case *exec.ExitError:
 		return err.Sys().(syscall.WaitStatus).ExitStatus()
 	default:
-		fmt.Fprintf(os.Stderr, "\x1B[31m%s\x1B[39m\n", err)
+		printError(err, options)
 		return 1
+	}
+}
+
+func printError(err error, options *gbuild.Options) {
+	makeRel := func(name string) string {
+		if relname, err := filepath.Rel(currentDirectory, name); err == nil {
+			return relname
+		}
+		return name
+	}
+
+	switch e := err.(type) {
+	case *scanner.Error:
+		options.PrintError("%s:%d:%d: %s\n", makeRel(e.Pos.Filename), e.Pos.Line, e.Pos.Column, e.Msg)
+	case types.Error:
+		pos := e.Fset.Position(e.Pos)
+		options.PrintError("%s:%d:%d: %s\n", makeRel(pos.Filename), pos.Line, pos.Column, e.Msg)
+	default:
+		options.PrintError("%s\n", e)
 	}
 }
 
@@ -461,6 +488,7 @@ var testmainTmpl = template.Must(template.New("main").Parse(`
 package main
 
 import (
+	"regexp"
 	"testing"
 
 {{if .NeedTest}}
@@ -489,8 +517,22 @@ var examples = []testing.InternalExample{
 {{end}}
 }
 
+var matchPat string
+var matchRe *regexp.Regexp
+
+func matchString(pat, str string) (result bool, err error) {
+	if matchRe == nil || matchPat != pat {
+		matchPat = pat
+		matchRe, err = regexp.Compile(matchPat)
+		if err != nil {
+			return
+		}
+	}
+	return matchRe.MatchString(str), nil
+}
+
 func main() {
-	testing.Main(nil, tests, benchmarks, examples)
+	testing.Main(matchString, tests, benchmarks, examples)
 }
 
 `))

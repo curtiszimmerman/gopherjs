@@ -4,12 +4,13 @@ import (
 	"fmt"
 	"go/ast"
 	"go/token"
+	"sort"
 	"strings"
 
-	"code.google.com/p/go.tools/go/types"
+	"golang.org/x/tools/go/types"
 )
 
-type This struct {
+type this struct {
 	ast.Ident
 }
 
@@ -25,11 +26,9 @@ func (c *funcContext) translateStmt(stmt ast.Stmt, label string) {
 
 	switch s := stmt.(type) {
 	case *ast.BlockStmt:
-		c.printLabel(label)
 		c.translateStmtList(s.List)
 
 	case *ast.IfStmt:
-		c.printLabel(label)
 		if s.Init != nil {
 			c.translateStmt(s.Init, "")
 		}
@@ -204,18 +203,24 @@ func (c *funcContext) translateStmt(stmt ast.Stmt, label string) {
 
 		case *types.Chan:
 			okVar := c.newIdent(c.newVariable("_ok"), types.Typ[types.Bool])
+			key := s.Key
+			tok := s.Tok
+			if key == nil {
+				key = ast.NewIdent("_")
+				tok = token.ASSIGN
+			}
 			forStmt := &ast.ForStmt{
 				Body: &ast.BlockStmt{
 					List: []ast.Stmt{
 						&ast.AssignStmt{
 							Lhs: []ast.Expr{
-								s.Key,
+								key,
 								okVar,
 							},
 							Rhs: []ast.Expr{
 								c.setType(&ast.UnaryExpr{X: c.newIdent(refVar, t), Op: token.ARROW}, types.NewTuple(types.NewVar(0, nil, "", t.Elem()), types.NewVar(0, nil, "", types.Typ[types.Bool]))),
 							},
-							Tok: s.Tok,
+							Tok: tok,
 						},
 						&ast.IfStmt{
 							Cond: &ast.UnaryExpr{X: okVar, Op: token.NOT},
@@ -233,19 +238,20 @@ func (c *funcContext) translateStmt(stmt ast.Stmt, label string) {
 		}
 
 	case *ast.BranchStmt:
-		c.printLabel(label)
-		labelSuffix := ""
+		normalLabel := ""
+		blockingLabel := ""
 		data := c.flowDatas[""]
 		if s.Label != nil {
-			labelSuffix = " " + s.Label.Name
+			normalLabel = " " + s.Label.Name
+			blockingLabel = " s" // use explicit label "s", because surrounding loop may not be flattened
 			data = c.flowDatas[s.Label.Name]
 		}
 		switch s.Tok {
 		case token.BREAK:
-			c.PrintCond(data.endCase == 0, fmt.Sprintf("break%s;", labelSuffix), fmt.Sprintf("$s = %d; continue;", data.endCase))
+			c.PrintCond(data.endCase == 0, fmt.Sprintf("break%s;", normalLabel), fmt.Sprintf("$s = %d; continue%s;", data.endCase, blockingLabel))
 		case token.CONTINUE:
 			data.postStmt()
-			c.PrintCond(data.beginCase == 0, fmt.Sprintf("continue%s;", labelSuffix), fmt.Sprintf("$s = %d; continue;", data.beginCase))
+			c.PrintCond(data.beginCase == 0, fmt.Sprintf("continue%s;", normalLabel), fmt.Sprintf("$s = %d; continue%s;", data.beginCase, blockingLabel))
 		case token.GOTO:
 			c.PrintCond(false, "goto "+s.Label.Name, fmt.Sprintf("$s = %d; continue;", c.labelCases[s.Label.Name]))
 		case token.FALLTHROUGH:
@@ -255,7 +261,6 @@ func (c *funcContext) translateStmt(stmt ast.Stmt, label string) {
 		}
 
 	case *ast.ReturnStmt:
-		c.printLabel(label)
 		results := s.Results
 		if c.resultNames != nil {
 			if len(s.Results) != 0 {
@@ -288,7 +293,6 @@ func (c *funcContext) translateStmt(stmt ast.Stmt, label string) {
 		}
 
 	case *ast.DeferStmt:
-		c.printLabel(label)
 		isBuiltin := false
 		isJs := false
 		switch fun := s.Call.Fun.(type) {
@@ -316,14 +320,13 @@ func (c *funcContext) translateStmt(stmt ast.Stmt, label string) {
 			return
 		}
 		sig := c.p.info.Types[s.Call.Fun].Type.Underlying().(*types.Signature)
-		args := c.translateArgs(sig, s.Call.Args, s.Call.Ellipsis.IsValid())
+		args := c.translateArgs(sig, s.Call.Args, s.Call.Ellipsis.IsValid(), true)
 		if len(c.blocking) != 0 {
-			args = append(args, "true")
+			args = append(args, "$BLOCKING")
 		}
 		c.Printf("$deferred.push([%s, [%s]]);", c.translateExpr(s.Call.Fun), strings.Join(args, ", "))
 
 	case *ast.AssignStmt:
-		c.printLabel(label)
 		if s.Tok != token.ASSIGN && s.Tok != token.DEFINE {
 			var op token.Token
 			switch s.Tok {
@@ -386,11 +389,11 @@ func (c *funcContext) translateStmt(stmt ast.Stmt, label string) {
 			}
 
 			lhsType := c.p.info.Types[s.Lhs[0]].Type
-			parts = append(parts, c.translateAssign(lhs, c.translateExpr(c.setType(&ast.BinaryExpr{
+			parts = append(parts, c.translateAssignOfExpr(lhs, c.setType(&ast.BinaryExpr{
 				X:  lhs,
 				Op: op,
 				Y:  c.setType(&ast.ParenExpr{X: s.Rhs[0]}, c.p.info.Types[s.Rhs[0]].Type),
-			}, lhsType)).String(), lhsType, s.Tok == token.DEFINE))
+			}, lhsType), lhsType, s.Tok == token.DEFINE))
 			c.Printf("%s", strings.Join(parts, " "))
 			return
 		}
@@ -486,7 +489,6 @@ func (c *funcContext) translateStmt(stmt ast.Stmt, label string) {
 		}, label)
 
 	case *ast.DeclStmt:
-		c.printLabel(label)
 		decl := s.Decl.(*ast.GenDecl)
 		switch decl.Tok {
 		case token.VAR:
@@ -513,27 +515,28 @@ func (c *funcContext) translateStmt(stmt ast.Stmt, label string) {
 		case token.TYPE:
 			for _, spec := range decl.Specs {
 				o := c.p.info.Defs[spec.(*ast.TypeSpec).Name].(*types.TypeName)
-				c.translateType(o, false)
-				c.initType(o)
+				c.p.typeNames = append(c.p.typeNames, o)
+				c.p.objectVars[o] = c.newVariableWithLevel(o.Name(), true, "")
+				c.p.dependencies[qualifiedName(o)] = true
 			}
 		case token.CONST:
 			// skip, constants are inlined
 		}
 
 	case *ast.ExprStmt:
-		c.printLabel(label)
 		expr := c.translateExpr(s.X)
 		if expr != nil {
 			c.Printf("%s;", expr)
 		}
 
 	case *ast.LabeledStmt:
-		c.printLabel(label)
+		if labelCase, ok := c.labelCases[s.Label.Name]; ok {
+			c.PrintCond(false, s.Label.Name+":", fmt.Sprintf("case %d:", labelCase))
+		}
 		c.translateStmt(s.Stmt, s.Label.Name)
 
 	case *ast.GoStmt:
-		c.printLabel(label)
-		c.Printf("$go(%s, [%s]);", c.translateExpr(s.Call.Fun), strings.Join(c.translateArgs(c.p.info.Types[s.Call.Fun].Type.Underlying().(*types.Signature), s.Call.Args, s.Call.Ellipsis.IsValid()), ", "))
+		c.Printf("$go(%s, [%s]);", c.translateExpr(s.Call.Fun), strings.Join(c.translateArgs(c.p.info.Types[s.Call.Fun].Type.Underlying().(*types.Signature), s.Call.Args, s.Call.Ellipsis.IsValid(), false), ", "))
 
 	case *ast.SendStmt:
 		chanType := c.p.info.Types[s.Chan].Type.Underlying().(*types.Chan)
@@ -542,7 +545,7 @@ func (c *funcContext) translateStmt(stmt ast.Stmt, label string) {
 			Args: []ast.Expr{s.Chan, s.Value},
 		}
 		c.blocking[call] = true
-		c.translateStmt(&ast.ExprStmt{call}, label)
+		c.translateStmt(&ast.ExprStmt{X: call}, label)
 
 	case *ast.SelectStmt:
 		var channels []string
@@ -678,9 +681,6 @@ clauseLoop:
 	}
 
 	var caseOffset, endCase int
-	if _, ok := c.labelCases[label]; ok {
-		flatten = true // always flatten if label is referenced by goto
-	}
 	if flatten {
 		caseOffset = c.caseCounter
 		endCase = caseOffset + len(branches) - 1
@@ -705,7 +705,6 @@ clauseLoop:
 		}()
 	}
 
-	c.printLabel(label)
 	if isSwitch && !flatten && label != "" {
 		c.Printf("%s:", label)
 	}
@@ -759,9 +758,6 @@ func (c *funcContext) translateLoopingStmt(cond string, body *ast.BlockStmt, bod
 	data := &flowData{
 		postStmt: post,
 	}
-	if _, ok := c.labelCases[label]; ok {
-		flatten = true // always flatten if label is referenced by goto
-	}
 	if flatten {
 		data.beginCase = c.caseCounter
 		data.endCase = c.caseCounter + 1
@@ -774,26 +770,31 @@ func (c *funcContext) translateLoopingStmt(cond string, body *ast.BlockStmt, bod
 		c.flowDatas[""] = prevFlowData
 	}()
 
-	c.printLabel(label)
 	if !flatten && label != "" {
 		c.Printf("%s:", label)
 	}
 	c.PrintCond(!flatten, fmt.Sprintf("while (%s) {", cond), fmt.Sprintf("case %d: if(!(%s)) { $s = %d; continue; }", data.beginCase, cond, data.endCase))
 	c.Indent(func() {
+		prevEV := c.p.escapingVars
+		c.p.escapingVars = make(map[types.Object]bool)
+		for escaping := range prevEV {
+			c.p.escapingVars[escaping] = true
+		}
+
 		v := &escapeAnalysis{
 			info:       c.p.info,
 			candidates: make(map[types.Object]bool),
 			escaping:   make(map[types.Object]bool),
 		}
 		ast.Walk(v, body)
-		prevEV := c.p.escapingVars
-		c.p.escapingVars = make(map[types.Object]bool)
-		for escaping := range prevEV {
-			c.p.escapingVars[escaping] = true
+		names := make([]string, 0, len(c.p.escapingVars))
+		for obj := range v.escaping {
+			names = append(names, c.objectName(obj))
+			c.p.escapingVars[obj] = true
 		}
-		for escaping := range v.escaping {
-			c.Printf("%s = [undefined];", c.objectName(escaping))
-			c.p.escapingVars[escaping] = true
+		sort.Strings(names)
+		for _, name := range names {
+			c.Printf("%s = [undefined];", name)
 		}
 
 		if bodyPrefix != nil {
@@ -817,6 +818,13 @@ func (c *funcContext) translateLoopingStmt(cond string, body *ast.BlockStmt, bod
 }
 
 func (c *funcContext) translateAssignOfExpr(lhs, rhs ast.Expr, typ types.Type, define bool) string {
+	if l, ok := lhs.(*ast.IndexExpr); ok {
+		if t, ok := c.p.info.Types[l.X].Type.Underlying().(*types.Map); ok {
+			keyVar := c.newVariable("_key")
+			return fmt.Sprintf(`%s = %s; (%s || $throwRuntimeError("assignment to entry in nil map"))[%s] = { k: %s, v: %s };`, keyVar, c.translateImplicitConversionWithCloning(l.Index, t.Key()), c.translateExpr(l.X), c.makeKey(c.newIdent(keyVar, t.Key()), t.Key()), keyVar, c.translateImplicitConversionWithCloning(rhs, t.Elem()))
+		}
+	}
+
 	if _, ok := rhs.(*ast.CompositeLit); ok && define {
 		return fmt.Sprintf("%s = %s;", c.translateExpr(lhs), c.translateImplicitConversion(rhs, typ)) // skip $copy
 	}
@@ -829,19 +837,18 @@ func (c *funcContext) translateAssign(lhs ast.Expr, rhs string, typ types.Type, 
 		panic("translateAssign with blank lhs")
 	}
 
-	if l, ok := lhs.(*ast.IndexExpr); ok {
-		if t, ok := c.p.info.Types[l.X].Type.Underlying().(*types.Map); ok {
-			keyVar := c.newVariable("_key")
-			return fmt.Sprintf(`%s = %s; (%s || $throwRuntimeError("assignment to entry in nil map"))[%s] = { k: %s, v: %s };`, keyVar, c.translateImplicitConversion(l.Index, t.Key()), c.translateExpr(l.X), c.makeKey(c.newIdent(keyVar, t.Key()), t.Key()), keyVar, rhs)
-		}
+	isReflectValue := false
+	if named, ok := typ.(*types.Named); ok && named.Obj().Pkg() != nil && named.Obj().Pkg().Path() == "reflect" && named.Obj().Name() == "Value" {
+		isReflectValue = true
 	}
-
-	switch typ.Underlying().(type) {
-	case *types.Array, *types.Struct:
-		if define {
-			return fmt.Sprintf("%[1]s = %[2]s; $copy(%[1]s, %[3]s, %[4]s);", c.translateExpr(lhs), c.zeroValue(typ), rhs, c.typeName(typ))
+	if !isReflectValue { // this is a performance hack, but it is safe since reflect.Value has no exported fields and the reflect package does not violate this assumption
+		switch typ.Underlying().(type) {
+		case *types.Array, *types.Struct:
+			if define {
+				return fmt.Sprintf("%s = $clone(%s, %s);", c.translateExpr(lhs), rhs, c.typeName(typ))
+			}
+			return fmt.Sprintf("$copy(%s, %s, %s);", c.translateExpr(lhs), rhs, c.typeName(typ))
 		}
-		return fmt.Sprintf("$copy(%s, %s, %s);", c.translateExpr(lhs), rhs, c.typeName(typ))
 	}
 
 	switch l := lhs.(type) {
@@ -882,14 +889,6 @@ func (c *funcContext) translateAssign(lhs ast.Expr, rhs string, typ types.Type, 
 		}
 	default:
 		panic(fmt.Sprintf("Unhandled lhs type: %T\n", l))
-	}
-}
-
-func (c *funcContext) printLabel(label string) {
-	if label != "" {
-		if labelCase, ok := c.labelCases[label]; ok {
-			c.PrintCond(false, label+":", fmt.Sprintf("case %d:", labelCase))
-		}
 	}
 }
 

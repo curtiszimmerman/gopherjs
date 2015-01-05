@@ -2,18 +2,21 @@ package compiler
 
 import (
 	"bytes"
-	"code.google.com/p/go.tools/go/types"
 	"encoding/json"
 	"fmt"
-	"github.com/gopherjs/gopherjs/gcexporter"
 	"go/ast"
 	"go/token"
 	"sort"
 	"strings"
+
+	"github.com/gopherjs/gopherjs/gcexporter"
+	"golang.org/x/tools/go/types"
 )
 
 type funcContext struct {
 	p             *pkgContext
+	parent        *funcContext
+	name          string
 	sig           *types.Signature
 	allVars       map[string]int
 	localVars     []string
@@ -35,12 +38,15 @@ type pkgContext struct {
 	info          *types.Info
 	importContext *ImportContext
 	comments      ast.CommentMap
+	typeNames     []*types.TypeName
 	funcContexts  map[*types.Func]*funcContext
 	pkgVars       map[string]string
 	objectVars    map[types.Object]string
+	anonTypes     []types.Type
+	anonTypeVars  map[string]string
 	escapingVars  map[types.Object]bool
 	indentation   int
-	dependencies  map[types.Object]bool
+	dependencies  map[string]bool
 	minify        bool
 }
 
@@ -48,6 +54,18 @@ type flowData struct {
 	postStmt  func()
 	beginCase int
 	endCase   int
+}
+
+type ImportContext struct {
+	Packages map[string]*types.Package
+	Import   func(string) (*Archive, error)
+}
+
+func NewImportContext(importFunc func(string) (*Archive, error)) *ImportContext {
+	return &ImportContext{
+		Packages: map[string]*types.Package{"unsafe": types.Unsafe},
+		Import:   importFunc,
+	}
 }
 
 func Compile(importPath string, files []*ast.File, fileSet *token.FileSet, importContext *ImportContext, minify bool) (*Archive, error) {
@@ -59,12 +77,16 @@ func Compile(importPath string, files []*ast.File, fileSet *token.FileSet, impor
 		Selections: make(map[*ast.SelectorExpr]*types.Selection),
 	}
 
+	var importError error
 	var errList ErrorList
 	var previousErr error
 	config := &types.Config{
 		Packages: importContext.Packages,
 		Import: func(_ map[string]*types.Package, path string) (*types.Package, error) {
 			if _, err := importContext.Import(path); err != nil {
+				if importError == nil {
+					importError = err
+				}
 				return nil, err
 			}
 			return importContext.Packages[path], nil
@@ -79,7 +101,17 @@ func Compile(importPath string, files []*ast.File, fileSet *token.FileSet, impor
 		},
 	}
 	typesPkg, err := config.Check(importPath, fileSet, files, info)
+	if importError != nil {
+		return nil, importError
+	}
 	if errList != nil {
+		if len(errList) > 10 {
+			pos := token.NoPos
+			if last, ok := errList[9].(types.Error); ok {
+				pos = last.Pos
+			}
+			errList = append(errList[:10], types.Error{Fset: fileSet, Pos: pos, Msg: "too many errors"})
+		}
 		return nil, errList
 	}
 	if err != nil {
@@ -93,13 +125,6 @@ func Compile(importPath string, files []*ast.File, fileSet *token.FileSet, impor
 	if err := fileSet.Write(json.NewEncoder(encodedFileSet).Encode); err != nil {
 		return nil, err
 	}
-	archive := &Archive{
-		ImportPath:   PkgPath(importPath),
-		GcData:       gcData.Bytes(),
-		Dependencies: []PkgPath{PkgPath("github.com/gopherjs/gopherjs/js"), PkgPath("runtime")}, // all packages depend on those
-		FileSet:      encodedFileSet.Bytes(),
-		Minified:     minify,
-	}
 
 	c := &funcContext{
 		p: &pkgContext{
@@ -110,9 +135,10 @@ func Compile(importPath string, files []*ast.File, fileSet *token.FileSet, impor
 			funcContexts:  make(map[*types.Func]*funcContext),
 			pkgVars:       make(map[string]string),
 			objectVars:    make(map[types.Object]string),
+			anonTypeVars:  make(map[string]string),
 			escapingVars:  make(map[types.Object]bool),
 			indentation:   1,
-			dependencies:  make(map[types.Object]bool),
+			dependencies:  make(map[string]bool),
 			minify:        minify,
 		},
 		allVars:     make(map[string]int),
@@ -128,24 +154,27 @@ func Compile(importPath string, files []*ast.File, fileSet *token.FileSet, impor
 	}
 
 	// imports
+	var importDecls []*Decl
 	var importedPaths []string
 	for _, importedPkg := range typesPkg.Imports() {
 		varName := c.newVariableWithLevel(importedPkg.Name(), true, "")
 		c.p.pkgVars[importedPkg.Path()] = varName
-		archive.Imports = append(archive.Imports, PkgImport{Path: PkgPath(importedPkg.Path()), VarName: varName})
 		importedPaths = append(importedPaths, importedPkg.Path())
 	}
 	sort.Strings(importedPaths)
 	for _, impPath := range importedPaths {
-		impOutput, err := importContext.Import(impPath)
-		if err != nil {
-			return nil, err
-		}
-		archive.AddDependenciesOf(impOutput)
+		id := c.newIdent(fmt.Sprintf(`%s.$init`, c.p.pkgVars[impPath]), types.NewSignature(nil, nil, nil, nil, false))
+		call := &ast.CallExpr{Fun: id}
+		c.blocking[call] = true
+		c.flattened[call] = true
+		importDecls = append(importDecls, &Decl{
+			Vars:     []string{c.p.pkgVars[impPath]},
+			BodyCode: []byte(fmt.Sprintf("\t%s = $packages[\"%s\"];\n", c.p.pkgVars[impPath], impPath)),
+			InitCode: c.CatchOutput(1, func() { c.translateStmt(&ast.ExprStmt{X: call}, "") }),
+		})
 	}
 
 	var functions []*ast.FuncDecl
-	var toplevelTypes []*types.TypeName
 	var vars []*types.Var
 	for _, file := range files {
 		for k, v := range ast.NewCommentMap(fileSet, file, file.Comments) {
@@ -164,7 +193,9 @@ func Compile(importPath string, files []*ast.File, fileSet *token.FileSet, impor
 					}
 				}
 				o := c.p.info.Defs[d.Name].(*types.Func)
-				c.p.funcContexts[o] = c.p.analyzeFunction(sig, d.Body)
+				context := c.p.analyzeFunction(sig, d.Body)
+				context.name = d.Name.Name
+				c.p.funcContexts[o] = context
 				if sig.Recv() == nil {
 					c.objectName(o) // register toplevel name
 				}
@@ -176,7 +207,7 @@ func Compile(importPath string, files []*ast.File, fileSet *token.FileSet, impor
 				case token.TYPE:
 					for _, spec := range d.Specs {
 						o := c.p.info.Defs[spec.(*ast.TypeSpec).Name].(*types.TypeName)
-						toplevelTypes = append(toplevelTypes, o)
+						c.p.typeNames = append(c.p.typeNames, o)
 						c.objectName(o) // register toplevel name
 					}
 				case token.VAR:
@@ -214,37 +245,20 @@ func Compile(importPath string, files []*ast.File, fileSet *token.FileSet, impor
 		}
 	}
 
-	collectDependencies := func(self types.Object, f func()) []DepId {
-		c.p.dependencies = make(map[types.Object]bool)
+	collectDependencies := func(self string, f func()) []string {
+		c.p.dependencies = make(map[string]bool)
 		f()
 		var deps []string
+		delete(c.p.dependencies, self)
 		for dep := range c.p.dependencies {
-			if dep != self {
-				deps = append(deps, dep.Pkg().Path()+":"+dep.Name())
-			}
+			deps = append(deps, dep)
 		}
 		sort.Strings(deps)
-		depIds := make([]DepId, len(deps))
-		for i, dep := range deps {
-			depIds[i] = DepId(dep)
-		}
-		return depIds
-	}
-
-	// types
-	for _, o := range toplevelTypes {
-		typeName := c.objectName(o)
-		var d Decl
-		d.Vars = []string{typeName}
-		d.DceFilters = []DepId{DepId(o.Name())}
-		d.DceDeps = collectDependencies(o, func() {
-			d.BodyCode = removeWhitespace(c.CatchOutput(0, func() { c.translateType(o, true) }), minify)
-			d.InitCode = removeWhitespace(c.CatchOutput(1, func() { c.initType(o) }), minify)
-		})
-		archive.Declarations = append(archive.Declarations, d)
+		return deps
 	}
 
 	// variables
+	var varDecls []*Decl
 	varsWithInit := make(map[*types.Var]bool)
 	for _, init := range c.p.info.InitOrder {
 		for _, o := range init.Lhs {
@@ -257,16 +271,12 @@ func Compile(importPath string, files []*ast.File, fileSet *token.FileSet, impor
 			d.Vars = []string{c.objectName(o)}
 		}
 		if _, ok := varsWithInit[o]; !ok {
-			d.DceDeps = collectDependencies(nil, func() {
-				value := c.zeroValue(o.Type())
-				if importPath == "runtime" && o.Name() == "sizeof_C_MStats" {
-					value = "3712"
-				}
-				d.InitCode = removeWhitespace([]byte(fmt.Sprintf("\t\t%s = %s;\n", c.objectName(o), value)), minify)
+			d.DceDeps = collectDependencies("", func() {
+				d.InitCode = []byte(fmt.Sprintf("\t\t%s = %s;\n", c.objectName(o), c.zeroValue(o.Type())))
 			})
 		}
-		d.DceFilters = []DepId{DepId(o.Name())}
-		archive.Declarations = append(archive.Declarations, d)
+		d.DceFilters = []string{qualifiedName(o)}
+		varDecls = append(varDecls, &d)
 	}
 	for _, init := range c.p.info.InitOrder {
 		lhs := make([]ast.Expr, len(init.Lhs))
@@ -277,35 +287,36 @@ func Compile(importPath string, files []*ast.File, fileSet *token.FileSet, impor
 			varsWithInit[o] = true
 		}
 		var d Decl
-		d.DceDeps = collectDependencies(nil, func() {
+		d.DceDeps = collectDependencies("", func() {
 			c.localVars = nil
-			d.InitCode = removeWhitespace(c.CatchOutput(1, func() {
+			d.InitCode = c.CatchOutput(1, func() {
 				ast.Walk(c, init.Rhs)
 				c.translateStmt(&ast.AssignStmt{
 					Lhs: lhs,
 					Tok: token.DEFINE,
 					Rhs: []ast.Expr{init.Rhs},
 				}, "")
-			}), minify)
+			})
 			d.Vars = append(d.Vars, c.localVars...)
 		})
 		if len(init.Lhs) == 1 {
 			v := hasCallVisitor{c.p.info, false}
 			ast.Walk(&v, init.Rhs)
 			if !v.hasCall {
-				d.DceFilters = []DepId{DepId(init.Lhs[0].Name())}
+				d.DceFilters = []string{qualifiedName(init.Lhs[0])}
 			}
 		}
-		archive.Declarations = append(archive.Declarations, d)
+		varDecls = append(varDecls, &d)
 	}
 
 	// functions
+	var funcDecls []*Decl
 	var mainFunc *types.Func
 	for _, fun := range functions {
 		o := c.p.info.Defs[fun.Name].(*types.Func)
 		context := c.p.funcContexts[o]
 		d := Decl{
-			FullName: []byte(o.FullName()),
+			FullName: o.FullName(),
 			Blocking: len(context.blocking) != 0,
 		}
 		if fun.Recv == nil {
@@ -314,15 +325,15 @@ func Compile(importPath string, files []*ast.File, fileSet *token.FileSet, impor
 			case "main":
 				mainFunc = o
 			case "init":
-				d.InitCode = removeWhitespace(c.CatchOutput(1, func() {
+				d.InitCode = c.CatchOutput(1, func() {
 					id := c.newIdent("", types.NewSignature(nil, nil, nil, nil, false))
 					c.p.info.Uses[id] = o
 					call := &ast.CallExpr{Fun: id}
 					c.Visit(call)
 					c.translateStmt(&ast.ExprStmt{X: call}, "")
-				}), minify)
+				})
 			default:
-				d.DceFilters = []DepId{DepId(o.Name())}
+				d.DceFilters = []string{qualifiedName(o)}
 			}
 		}
 		if fun.Recv != nil {
@@ -332,129 +343,131 @@ func Compile(importPath string, files []*ast.File, fileSet *token.FileSet, impor
 			if isPointer {
 				namedRecvType = ptr.Elem().(*types.Named)
 			}
-			d.DceFilters = []DepId{DepId(namedRecvType.Obj().Name())}
+			d.DceFilters = []string{qualifiedName(namedRecvType.Obj())}
 			if !fun.Name.IsExported() {
-				d.DceFilters = append(d.DceFilters, DepId(fun.Name.Name))
+				d.DceFilters = append(d.DceFilters, qualifiedName(o)+"~")
 			}
 		}
 
-		d.DceDeps = collectDependencies(o, func() {
-			d.BodyCode = removeWhitespace(c.translateToplevelFunction(fun, context), minify)
+		d.DceDeps = collectDependencies(qualifiedName(o), func() {
+			d.BodyCode = c.translateToplevelFunction(fun, context)
 		})
-		archive.Declarations = append(archive.Declarations, d)
-		if fun.Recv == nil && strings.HasPrefix(fun.Name.String(), "Test") {
-			archive.Tests = append(archive.Tests, fun.Name.String())
-		}
+		funcDecls = append(funcDecls, &d)
 	}
-
-	archive.BlockingInit = len(c.blocking) != 0
-
-	// $run function
 	if typesPkg.Name() == "main" {
-		var stmts []ast.Stmt
-		for _, dep := range archive.Dependencies {
-			id := c.newIdent(fmt.Sprintf(`$packages["%s"].$init`, dep), types.NewSignature(nil, nil, nil, nil, false))
-			call := &ast.CallExpr{Fun: id}
-			depArchive, err := importContext.Import(string(dep))
-			if err != nil {
-				panic(err)
-			}
-			if depArchive.BlockingInit {
-				c.blocking[call] = true
-				c.flattened[call] = true
-			}
-			stmts = append(stmts, &ast.ExprStmt{X: call})
+		if mainFunc == nil {
+			return nil, fmt.Errorf("missing main function")
 		}
-
-		{
-			id := c.newIdent("$pkg.$init", types.NewSignature(nil, nil, nil, nil, false))
-			call := &ast.CallExpr{Fun: id}
-			if archive.BlockingInit {
-				c.blocking[call] = true
-				c.flattened[call] = true
-			}
-			stmts = append(stmts, &ast.ExprStmt{X: call})
-		}
-
-		{
-			if mainFunc == nil {
-				return nil, fmt.Errorf("missing main function")
-			}
-			id := c.newIdent("", types.NewSignature(nil, nil, nil, nil, false))
-			c.p.info.Uses[id] = mainFunc
-			call := &ast.CallExpr{Fun: id}
-			c.Visit(call)
-			stmts = append(stmts, &ast.ExprStmt{X: call})
-		}
-
-		archive.Declarations = append(archive.Declarations, Decl{
-			BodyCode: removeWhitespace(append(append([]byte("\t$pkg.$run = function($b) {\n"), c.translateFunctionBody(stmts)...), []byte("\t};\n")...), minify),
+		id := c.newIdent("", types.NewSignature(nil, nil, nil, nil, false))
+		c.p.info.Uses[id] = mainFunc
+		call := &ast.CallExpr{Fun: id}
+		c.Visit(call)
+		funcDecls = append(funcDecls, &Decl{
+			InitCode: c.CatchOutput(1, func() { c.translateStmt(&ast.ExprStmt{X: call}, "") }),
 		})
 	}
 
-	return archive, nil
-}
+	// named types
+	var typeDecls []*Decl
+	for _, o := range c.p.typeNames {
+		typeName := c.objectName(o)
+		d := Decl{
+			Vars:       []string{typeName},
+			DceFilters: []string{qualifiedName(o)},
+		}
+		d.DceDeps = collectDependencies(qualifiedName(o), func() {
+			d.BodyCode = c.CatchOutput(0, func() {
+				typeName := c.objectName(o)
+				lhs := typeName
+				if o.Parent() == c.p.pkg.Scope() {
+					lhs += " = $pkg." + o.Name()
+				}
+				size := int64(0)
+				constructor := "null"
+				switch t := o.Type().Underlying().(type) {
+				case *types.Struct:
+					params := make([]string, t.NumFields())
+					for i := 0; i < t.NumFields(); i++ {
+						params[i] = fieldName(t, i) + "_"
+					}
+					constructor = fmt.Sprintf("function(%s) {\n%sthis.$val = this;\n", strings.Join(params, ", "), strings.Repeat("\t", c.p.indentation+1))
+					for i := 0; i < t.NumFields(); i++ {
+						name := fieldName(t, i)
+						constructor += fmt.Sprintf("%sthis.%s = %s_ !== undefined ? %s_ : %s;\n", strings.Repeat("\t", c.p.indentation+1), name, name, name, c.zeroValue(t.Field(i).Type()))
+					}
+					constructor += strings.Repeat("\t", c.p.indentation) + "}"
+				case *types.Basic, *types.Array, *types.Slice, *types.Chan, *types.Signature, *types.Interface, *types.Pointer, *types.Map:
+					size = sizes32.Sizeof(t)
+				}
+				c.Printf(`%s = $newType(%d, %s, "%s.%s", "%s", "%s", %s);`, lhs, size, typeKind(o.Type()), o.Pkg().Name(), o.Name(), o.Name(), o.Pkg().Path(), constructor)
+			})
+			d.InitCode = c.CatchOutput(1, func() {
+				if _, isInterface := o.Type().Underlying().(*types.Interface); !isInterface {
+					writeMethodSet := func(t types.Type) {
+						methodSet := types.NewMethodSet(t)
+						if methodSet.Len() == 0 {
+							return
+						}
+						methods := make([]string, methodSet.Len())
+						for i := range methods {
+							method := methodSet.At(i)
+							pkgPath := ""
+							if !method.Obj().Exported() {
+								pkgPath = method.Obj().Pkg().Path()
+							}
+							t := method.Type().(*types.Signature)
+							embeddedIndex := -1
+							if len(method.Index()) > 1 {
+								embeddedIndex = method.Index()[0]
+							}
+							name := method.Obj().Name()
+							if reservedKeywords[name] {
+								name += "$"
+							}
+							methods[i] = fmt.Sprintf(`["%s", "%s", "%s", $funcType(%s), %d]`, name, method.Obj().Name(), pkgPath, c.initArgs(t), embeddedIndex)
+						}
+						c.Printf("%s.methods = [%s];", c.typeName(t), strings.Join(methods, ", "))
+					}
+					writeMethodSet(o.Type())
+					writeMethodSet(types.NewPointer(o.Type()))
+				}
+				switch t := o.Type().Underlying().(type) {
+				case *types.Array, *types.Chan, *types.Interface, *types.Map, *types.Pointer, *types.Slice, *types.Signature, *types.Struct:
+					c.Printf("%s.init(%s);", c.objectName(o), c.initArgs(t))
+				}
+			})
+		})
+		typeDecls = append(typeDecls, &d)
+	}
 
-func (c *funcContext) translateType(o *types.TypeName, toplevel bool) {
-	typeName := c.objectName(o)
-	lhs := typeName
-	if toplevel {
-		lhs += " = $pkg." + o.Name()
-	}
-	size := int64(0)
-	constructor := "null"
-	switch t := o.Type().Underlying().(type) {
-	case *types.Struct:
-		params := make([]string, t.NumFields())
-		for i := 0; i < t.NumFields(); i++ {
-			params[i] = fieldName(t, i) + "_"
+	// anonymous types
+	var anonTypeDecls []*Decl
+	for _, t := range c.p.anonTypes {
+		d := Decl{
+			Vars:       []string{c.p.anonTypeVars[t.String()]},
+			DceFilters: []string{importPath + ":" + t.String()},
 		}
-		constructor = fmt.Sprintf("function(%s) {\n%sthis.$val = this;\n", strings.Join(params, ", "), strings.Repeat("\t", c.p.indentation+1))
-		for i := 0; i < t.NumFields(); i++ {
-			name := fieldName(t, i)
-			constructor += fmt.Sprintf("%sthis.%s = %s_ !== undefined ? %s_ : %s;\n", strings.Repeat("\t", c.p.indentation+1), name, name, name, c.zeroValue(t.Field(i).Type()))
-		}
-		constructor += strings.Repeat("\t", c.p.indentation) + "}"
-	case *types.Basic, *types.Array, *types.Slice, *types.Chan, *types.Signature, *types.Interface, *types.Pointer, *types.Map:
-		size = sizes32.Sizeof(t)
+		d.DceDeps = collectDependencies("", func() {
+			d.InitCode = []byte(fmt.Sprintf("\t\t%s = $%sType(%s);\n", c.p.anonTypeVars[t.String()], strings.ToLower(typeKind(t)[5:]), c.initArgs(t)))
+		})
+		anonTypeDecls = append(anonTypeDecls, &d)
 	}
-	c.Printf(`%s = $newType(%d, "%s", "%s.%s", "%s", "%s", %s);`, lhs, size, typeKind(o.Type()), o.Pkg().Name(), o.Name(), o.Name(), o.Pkg().Path(), constructor)
-}
 
-func (c *funcContext) initType(o types.Object) {
-	if _, isInterface := o.Type().Underlying().(*types.Interface); !isInterface {
-		writeMethodSet := func(t types.Type) {
-			methodSet := types.NewMethodSet(t)
-			if methodSet.Len() == 0 {
-				return
-			}
-			methods := make([]string, methodSet.Len())
-			for i := range methods {
-				method := methodSet.At(i)
-				pkgPath := ""
-				if !method.Obj().Exported() {
-					pkgPath = method.Obj().Pkg().Path()
-				}
-				t := method.Type().(*types.Signature)
-				embeddedIndex := -1
-				if len(method.Index()) > 1 {
-					embeddedIndex = method.Index()[0]
-				}
-				name := method.Obj().Name()
-				if reservedKeywords[name] {
-					name += "$"
-				}
-				methods[i] = fmt.Sprintf(`["%s", "%s", "%s", $funcType(%s), %d]`, name, method.Obj().Name(), pkgPath, c.initArgs(t), embeddedIndex)
-			}
-			c.Printf("%s.methods = [%s];", c.typeName(t), strings.Join(methods, ", "))
-		}
-		writeMethodSet(o.Type())
-		writeMethodSet(types.NewPointer(o.Type()))
+	var allDecls []*Decl
+	for _, d := range append(append(append(append(importDecls, anonTypeDecls...), typeDecls...), varDecls...), funcDecls...) {
+		d.BodyCode = removeWhitespace(d.BodyCode, minify)
+		d.InitCode = removeWhitespace(d.InitCode, minify)
+		allDecls = append(allDecls, d)
 	}
-	switch t := o.Type().Underlying().(type) {
-	case *types.Array, *types.Chan, *types.Interface, *types.Map, *types.Pointer, *types.Slice, *types.Signature, *types.Struct:
-		c.Printf("%s.init(%s);", c.objectName(o), c.initArgs(t))
-	}
+
+	return &Archive{
+		ImportPath:   importPath,
+		Imports:      importedPaths,
+		GcData:       gcData.Bytes(),
+		Declarations: allDecls,
+		FileSet:      encodedFileSet.Bytes(),
+		Minified:     minify,
+	}, nil
 }
 
 func (c *funcContext) initArgs(ty types.Type) string {
@@ -525,16 +538,30 @@ func (c *funcContext) translateToplevelFunction(fun *ast.FuncDecl, context *func
 		}
 
 		stmts := fun.Body.List
+		for _, p := range fun.Type.Params.List {
+			for _, n := range p.Names {
+				switch c.p.info.Defs[n].Type().Underlying().(type) {
+				case *types.Array, *types.Struct:
+					stmts = append([]ast.Stmt{
+						&ast.AssignStmt{
+							Lhs: []ast.Expr{n},
+							Tok: token.DEFINE,
+							Rhs: []ast.Expr{n},
+						},
+					}, stmts...)
+				}
+			}
+		}
 		if recv != nil && !isBlank(recv) {
 			stmts = append([]ast.Stmt{
 				&ast.AssignStmt{
 					Lhs: []ast.Expr{recv},
 					Tok: token.DEFINE,
-					Rhs: []ast.Expr{c.setType(&This{}, sig.Recv().Type())},
+					Rhs: []ast.Expr{c.setType(&this{}, sig.Recv().Type())},
 				},
 			}, stmts...)
 		}
-		params, body := context.translateFunction(fun.Type, stmts, c.allVars)
+		params, body := context.translateFunction(fun.Type, stmts, c)
 		joinedParams = strings.Join(params, ", ")
 		return []byte(fmt.Sprintf("\t%s = function(%s) {\n%s\t};\n", lhs, joinedParams, string(body)))
 	}
@@ -721,14 +748,19 @@ func (c *funcContext) markBlocking(stack []ast.Node) {
 	}
 }
 
-func (c *funcContext) translateFunction(typ *ast.FuncType, stmts []ast.Stmt, outerVars map[string]int) ([]string, []byte) {
-	c.allVars = make(map[string]int, len(outerVars))
-	for k, v := range outerVars {
+func (c *funcContext) translateFunction(typ *ast.FuncType, stmts []ast.Stmt, outerContext *funcContext) ([]string, []byte) {
+	c.parent = outerContext
+	c.allVars = make(map[string]int, len(outerContext.allVars))
+	for k, v := range outerContext.allVars {
 		c.allVars[k] = v
 	}
 
 	var params []string
 	for _, param := range typ.Params.List {
+		if len(param.Names) == 0 {
+			params = append(params, c.newVariable("param"))
+			continue
+		}
 		for _, ident := range param.Names {
 			if isBlank(ident) {
 				params = append(params, c.newVariable("param"))
@@ -770,8 +802,12 @@ func (c *funcContext) translateFunctionBody(stmts []ast.Stmt) []byte {
 
 		if len(c.blocking) != 0 {
 			c.localVars = append(c.localVars, "$r")
-			prefix = prefix + " if(!$b) { $nonblockingCall(); }; var $f = function() {"
-			suffix = " }; $f.$blocking = true; return $f;" + suffix
+			f := "$f"
+			if c.name != "" && !c.p.minify {
+				f = "$blocking_" + c.name
+			}
+			prefix = prefix + fmt.Sprintf(" if($b !== $BLOCKING) { $nonblockingCall(); }; var %s = function() {", f)
+			suffix = fmt.Sprintf(" }; %s.$blocking = true; return %s;", f, f) + suffix
 		}
 
 		if c.hasDefer {
@@ -815,7 +851,7 @@ func (c *funcContext) translateFunctionBody(stmts []ast.Stmt) []byte {
 
 		if len(c.flattened) != 0 {
 			c.localVars = append(c.localVars, "$s = 0")
-			prefix = prefix + " while (true) { switch ($s) { case 0:"
+			prefix = prefix + " s: while (true) { switch ($s) { case 0:"
 			suffix = " case -1: } return; }" + suffix
 		}
 

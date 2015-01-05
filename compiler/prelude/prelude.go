@@ -25,11 +25,12 @@ var $min = Math.min;
 var $mod = function(x, y) { return x % y; };
 var $parseInt = parseInt;
 var $parseFloat = function(f) {
-  if (f.constructor === Number) {
+  if (f !== undefined && f !== null && f.constructor === Number) {
     return f;
   }
   return parseFloat(f);
 };
+var $flushConsole = function() {};
 
 var $mapArray = function(array, f) {
   var newArray = new array.constructor(array.length), i;
@@ -227,22 +228,26 @@ var $copySlice = function(dst, src) {
 };
 
 var $copy = function(dst, src, type) {
-  var i;
   switch (type.kind) {
-  case "Array":
+  case $kindArray:
     $internalCopy(dst, src, 0, 0, src.length, type.elem);
-    return true;
-  case "Struct":
-    for (i = 0; i < type.fields.length; i++) {
+    break;
+  case $kindStruct:
+    for (var i = 0; i < type.fields.length; i++) {
       var field = type.fields[i];
-      var name = field[0];
-      if (!$copy(dst[name], src[name], field[3])) {
-        dst[name] = src[name];
+      var fieldName = field[0];
+      var fieldType = field[3];
+      switch (fieldType.kind) {
+      case $kindArray:
+      case $kindStruct:
+        $copy(dst[fieldName], src[fieldName], fieldType);
+        continue;
+      default:
+        dst[fieldName] = src[fieldName];
+        continue;
       }
     }
-    return true;
-  default:
-    return false;
+    break;
   }
 };
 
@@ -258,8 +263,8 @@ var $internalCopy = function(dst, src, dstOffset, srcOffset, n, elem) {
   }
 
   switch (elem.kind) {
-  case "Array":
-  case "Struct":
+  case $kindArray:
+  case $kindStruct:
     for (i = 0; i < n; i++) {
       $copy(dst[dstOffset + i], src[srcOffset + i], elem);
     }
@@ -327,21 +332,21 @@ var $equal = function(a, b, type) {
   }
   var i;
   switch (type.kind) {
-  case "Float32":
+  case $kindFloat32:
     return $float32IsEqual(a, b);
-  case "Complex64":
+  case $kindComplex64:
     return $float32IsEqual(a.$real, b.$real) && $float32IsEqual(a.$imag, b.$imag);
-  case "Complex128":
+  case $kindComplex128:
     return a.$real === b.$real && a.$imag === b.$imag;
-  case "Int64":
-  case "Uint64":
+  case $kindInt64:
+  case $kindUint64:
     return a.$high === b.$high && a.$low === b.$low;
-  case "Ptr":
+  case $kindPtr:
     if (a.constructor.Struct) {
       return false;
     }
     return $pointerIsEqual(a, b);
-  case "Array":
+  case $kindArray:
     if (a.length != b.length) {
       return false;
     }
@@ -352,7 +357,7 @@ var $equal = function(a, b, type) {
       }
     }
     return true;
-  case "Struct":
+  case $kindStruct:
     for (i = 0; i < type.fields.length; i++) {
       var field = type.fields[i];
       var name = field[0];
@@ -371,10 +376,10 @@ var $interfaceIsEqual = function(a, b) {
     return a === b;
   }
   switch (a.constructor.kind) {
-  case "Func":
-  case "Map":
-  case "Slice":
-  case "Struct":
+  case $kindFunc:
+  case $kindMap:
+  case $kindSlice:
+  case $kindStruct:
     $throwRuntimeError("comparing uncomparable type " + a.constructor.string);
   case undefined: /* js.Object */
     return a === b;
@@ -387,15 +392,11 @@ var $float32IsEqual = function(a, b) {
   if (a === b) {
     return true;
   }
-  if (a === 0 || b === 0 || a === 1/0 || b === 1/0 || a === -1/0 || b === -1/0 || a !== a || b !== b) {
+  if (a === 1/0 || b === 1/0 || a === -1/0 || b === -1/0 || a !== a || b !== b) {
     return false;
   }
   var math = $packages["math"];
   return math !== undefined && math.Float32bits(a) === math.Float32bits(b);
-};
-
-var $sliceIsEqual = function(a, ai, b, bi) {
-  return a.$array === b.$array && a.$offset + ai === b.$offset + bi;
 };
 
 var $pointerIsEqual = function(a, b) {
@@ -405,11 +406,15 @@ var $pointerIsEqual = function(a, b) {
   if (a.$get === $throwNilPointerError || b.$get === $throwNilPointerError) {
     return a.$get === $throwNilPointerError && b.$get === $throwNilPointerError;
   }
-  var old = a.$get();
-  var dummy = new Object();
+  var va = a.$get();
+  var vb = b.$get();
+  if (va !== vb) {
+    return false;
+  }
+  var dummy = va + 1;
   a.$set(dummy);
   var equal = b.$get() === dummy;
-  a.$set(old);
+  a.$set(va);
   return equal;
 };
 `

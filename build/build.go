@@ -28,33 +28,45 @@ func (e *ImportCError) Error() string {
 	return `importing "C" is not supported by GopherJS`
 }
 
-func NewBuildContext(archSuffix string) *build.Context {
-	if strings.HasPrefix(runtime.Version(), "go1.") && runtime.Version()[4] < '3' {
-		panic("GopherJS requires Go 1.3. Please upgrade.")
+func NewBuildContext(installSuffix string) *build.Context {
+	if strings.HasPrefix(runtime.Version(), "go1.") && runtime.Version()[4] < '4' {
+		panic("GopherJS requires Go 1.4. Please upgrade.")
 	}
 	return &build.Context{
-		GOROOT:      build.Default.GOROOT,
-		GOPATH:      build.Default.GOPATH,
-		GOOS:        build.Default.GOOS,
-		GOARCH:      archSuffix,
-		Compiler:    "gc",
-		BuildTags:   []string{"netgo"},
-		ReleaseTags: build.Default.ReleaseTags,
+		GOROOT:        build.Default.GOROOT,
+		GOPATH:        build.Default.GOPATH,
+		GOOS:          build.Default.GOOS,
+		GOARCH:        "js",
+		InstallSuffix: installSuffix,
+		Compiler:      "gc",
+		BuildTags:     []string{"netgo"},
+		ReleaseTags:   build.Default.ReleaseTags,
 	}
 }
 
-func Import(path string, mode build.ImportMode, archSuffix string) (*build.Package, error) {
+func Import(path string, mode build.ImportMode, installSuffix string) (*build.Package, error) {
 	if path == "C" {
 		return nil, &ImportCError{}
 	}
 
-	buildContext := NewBuildContext(archSuffix)
+	buildContext := NewBuildContext(installSuffix)
 	if path == "runtime" || path == "syscall" {
 		buildContext.GOARCH = build.Default.GOARCH
-		buildContext.InstallSuffix = archSuffix
+		buildContext.InstallSuffix = "js"
+		if installSuffix != "" {
+			buildContext.InstallSuffix += "_" + installSuffix
+		}
 	}
 	pkg, err := buildContext.Import(path, "", mode)
-	if path == "hash/crc32" {
+	if err != nil {
+		return nil, err
+	}
+	switch path {
+	case "runtime":
+		pkg.GoFiles = []string{"error.go", fmt.Sprintf("zgoos_%s.go", runtime.GOOS), "zversion.go"}
+	case "runtime/pprof":
+		pkg.GoFiles = nil
+	case "hash/crc32":
 		pkg.GoFiles = []string{"crc32.go", "crc32_generic.go"}
 	}
 	if pkg.IsCommand() {
@@ -68,7 +80,7 @@ func Import(path string, mode build.ImportMode, archSuffix string) (*build.Packa
 			pkg.PkgObj = gopathPkgObj
 		}
 	}
-	return pkg, err
+	return pkg, nil
 }
 
 func Parse(pkg *build.Package, fileSet *token.FileSet) ([]*ast.File, error) {
@@ -89,7 +101,7 @@ func Parse(pkg *build.Package, fileSet *token.FileSet) ([]*ast.File, error) {
 	if isTestPkg {
 		importPath = importPath[:len(importPath)-5]
 	}
-	if nativesPkg, err := Import("github.com/gopherjs/gopherjs/compiler/natives/"+importPath, 0, "js"); err == nil {
+	if nativesPkg, err := Import("github.com/gopherjs/gopherjs/compiler/natives/"+importPath, 0, ""); err == nil {
 		names := append(nativesPkg.GoFiles, nativesPkg.TestGoFiles...)
 		if isTestPkg {
 			names = nativesPkg.XTestGoFiles
@@ -136,6 +148,9 @@ func Parse(pkg *build.Package, fileSet *token.FileSet) ([]*ast.File, error) {
 		r.Close()
 		if err != nil {
 			if list, isList := err.(scanner.ErrorList); isList {
+				if len(list) > 10 {
+					list = append(list[:10], &scanner.Error{Pos: list[9].Pos, Msg: "too many errors"})
+				}
 				for _, entry := range list {
 					errList = append(errList, entry)
 				}
@@ -143,6 +158,19 @@ func Parse(pkg *build.Package, fileSet *token.FileSet) ([]*ast.File, error) {
 			}
 			errList = append(errList, err)
 			continue
+		}
+
+		switch pkg.ImportPath {
+		case "crypto/rand", "encoding/json", "math/big", "math/rand", "testing", "time":
+			for _, spec := range file.Imports {
+				path, _ := strconv.Unquote(spec.Path.Value)
+				if path == "sync" {
+					if spec.Name == nil {
+						spec.Name = ast.NewIdent("sync")
+					}
+					spec.Path.Value = `"github.com/gopherjs/gopherjs/nosync"`
+				}
+			}
 		}
 
 		for _, decl := range file.Decls {
@@ -187,10 +215,26 @@ type Options struct {
 	Watch         bool
 	CreateMapFile bool
 	Minify        bool
+	Color         bool
+}
+
+func (o *Options) PrintError(format string, a ...interface{}) {
+	if o.Color {
+		format = "\x1B[31m" + format + "\x1B[39m"
+	}
+	fmt.Fprintf(os.Stderr, format, a...)
+}
+
+func (o *Options) PrintSuccess(format string, a ...interface{}) {
+	if o.Color {
+		format = "\x1B[32m" + format + "\x1B[39m"
+	}
+	fmt.Fprintf(os.Stderr, format, a...)
 }
 
 type PackageData struct {
 	*build.Package
+	JsFiles    []string
 	SrcModTime time.Time
 	UpToDate   bool
 	Archive    *compiler.Archive
@@ -233,18 +277,18 @@ func NewSession(options *Options) *Session {
 	return s
 }
 
-func (s *Session) ArchSuffix() string {
+func (s *Session) InstallSuffix() string {
 	if s.options.Minify {
-		return "js-min"
+		return "min"
 	}
-	return "js"
+	return ""
 }
 
 func (s *Session) BuildDir(packagePath string, importPath string, pkgObj string) error {
 	if s.Watcher != nil {
 		s.Watcher.Add(packagePath)
 	}
-	buildPkg, err := NewBuildContext(s.ArchSuffix()).ImportDir(packagePath, 0)
+	buildPkg, err := NewBuildContext(s.InstallSuffix()).ImportDir(packagePath, 0)
 	if err != nil {
 		return err
 	}
@@ -268,8 +312,15 @@ func (s *Session) BuildFiles(filenames []string, pkgObj string, packagePath stri
 			Name:       "main",
 			ImportPath: "main",
 			Dir:        packagePath,
-			GoFiles:    filenames,
 		},
+	}
+
+	for _, file := range filenames {
+		if strings.HasSuffix(file, ".inc.js") {
+			pkg.JsFiles = append(pkg.JsFiles, file)
+			continue
+		}
+		pkg.GoFiles = append(pkg.GoFiles, file)
 	}
 
 	if err := s.BuildPackage(pkg); err != nil {
@@ -286,7 +337,7 @@ func (s *Session) ImportPackage(path string) (*compiler.Archive, error) {
 		return pkg.Archive, nil
 	}
 
-	buildPkg, err := Import(path, build.AllowBinary, s.ArchSuffix())
+	buildPkg, err := Import(path, 0, s.InstallSuffix())
 	if s.Watcher != nil && buildPkg != nil { // add watch even on error
 		s.Watcher.Add(buildPkg.Dir)
 	}
@@ -294,23 +345,21 @@ func (s *Session) ImportPackage(path string) (*compiler.Archive, error) {
 		return nil, err
 	}
 	pkg := &PackageData{Package: buildPkg}
+
+	files, err := ioutil.ReadDir(pkg.Dir)
+	if err != nil {
+		return nil, err
+	}
+	for _, file := range files {
+		if strings.HasSuffix(file.Name(), ".inc.js") && file.Name()[0] != '_' {
+			pkg.JsFiles = append(pkg.JsFiles, file.Name())
+		}
+	}
+
 	if err := s.BuildPackage(pkg); err != nil {
 		return nil, err
 	}
 	return pkg.Archive, nil
-}
-
-func (s *Session) ImportDependencies(archive *compiler.Archive) ([]*compiler.Archive, error) {
-	var deps []*compiler.Archive
-	for _, depPath := range archive.Dependencies {
-		dep, err := s.ImportPackage(string(depPath))
-		if err != nil {
-			return nil, err
-		}
-		deps = append(deps, dep)
-	}
-	deps = append(deps, archive)
-	return deps, nil
 }
 
 func (s *Session) BuildPackage(pkg *PackageData) error {
@@ -352,7 +401,7 @@ func (s *Session) BuildPackage(pkg *PackageData) error {
 			}
 			_, err := s.ImportPackage(importedPkgPath)
 			if err != nil {
-				return err
+				return &scanner.Error{Pos: pkg.ImportPos[importedPkgPath][0], Msg: err.Error()}
 			}
 			impModeTime := s.Packages[importedPkgPath].SrcModTime
 			if impModeTime.After(pkg.SrcModTime) {
@@ -360,7 +409,7 @@ func (s *Session) BuildPackage(pkg *PackageData) error {
 			}
 		}
 
-		for _, name := range pkg.GoFiles {
+		for _, name := range append(pkg.GoFiles, pkg.JsFiles...) {
 			fileInfo, err := os.Stat(filepath.Join(pkg.Dir, name))
 			if err != nil {
 				return err
@@ -378,12 +427,13 @@ func (s *Session) BuildPackage(pkg *PackageData) error {
 				return nil
 			}
 
-			objFile, err := ioutil.ReadFile(pkg.PkgObj)
+			objFile, err := os.Open(pkg.PkgObj)
 			if err != nil {
 				return err
 			}
+			defer objFile.Close()
 
-			pkg.Archive, err = compiler.UnmarshalArchive(pkg.PkgObj, pkg.ImportPath, objFile, s.ImportContext)
+			pkg.Archive, err = compiler.ReadArchive(pkg.PkgObj, pkg.ImportPath, objFile, s.ImportContext.Packages)
 			if err != nil {
 				return err
 			}
@@ -401,6 +451,18 @@ func (s *Session) BuildPackage(pkg *PackageData) error {
 	if err != nil {
 		return err
 	}
+
+	var jsDecls []*compiler.Decl
+	for _, jsFile := range pkg.JsFiles {
+		code, err := ioutil.ReadFile(filepath.Join(pkg.Dir, jsFile))
+		if err != nil {
+			return err
+		}
+		jsDecls = append(jsDecls, &compiler.Decl{
+			BodyCode: append(code, '\n'),
+		})
+	}
+	pkg.Archive.Declarations = append(jsDecls, pkg.Archive.Declarations...)
 
 	if s.options.Verbose {
 		fmt.Println(pkg.ImportPath)
@@ -430,12 +492,13 @@ func (s *Session) writeLibraryPackage(pkg *PackageData, pkgObj string) error {
 		return err
 	}
 
-	data, err := compiler.MarshalArchive(pkg.Archive)
+	objFile, err := os.Create(pkgObj)
 	if err != nil {
 		return err
 	}
+	defer objFile.Close()
 
-	return ioutil.WriteFile(pkgObj, data, 0666)
+	return compiler.WriteArchive(pkg.Archive, objFile)
 }
 
 func (s *Session) WriteCommandPackage(pkg *PackageData, pkgObj string) error {
@@ -485,11 +548,11 @@ func (s *Session) WriteCommandPackage(pkg *PackageData, pkgObj string) error {
 		}
 	}
 
-	deps, err := s.ImportDependencies(pkg.Archive)
+	deps, err := compiler.ImportDependencies(pkg.Archive, s.ImportContext.Import)
 	if err != nil {
 		return err
 	}
-	return compiler.WriteProgramCode(deps, s.ImportContext, sourceMapFilter)
+	return compiler.WriteProgramCode(deps, sourceMapFilter)
 }
 
 // hasGopathPrefix returns true and the length of the matched GOPATH workspace,
@@ -505,12 +568,12 @@ func hasGopathPrefix(file, gopath string) (hasGopathPrefix bool, prefixLen int) 
 }
 
 func (s *Session) WaitForChange() {
-	fmt.Println("\x1B[32mwatching for changes...\x1B[39m")
+	s.options.PrintSuccess("watching for changes...\n")
 	select {
 	case ev := <-s.Watcher.Events:
-		fmt.Println("\x1B[32mchange detected: " + ev.Name + "\x1B[39m")
+		s.options.PrintSuccess("change detected: %s\n", ev.Name)
 	case err := <-s.Watcher.Errors:
-		fmt.Println("\x1B[32mwatcher error: " + err.Error() + "\x1B[39m")
+		s.options.PrintError("watcher error: %s\n", err.Error())
 	}
 	s.Watcher.Close()
 }

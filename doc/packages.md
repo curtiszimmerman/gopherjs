@@ -1,9 +1,9 @@
 Supported Packages
 ------------------
 
-On each commit, Travis CI automatically compiles all supported packages with GopherJS and runs their tests:
+On each commit, Circle CI automatically compiles all supported packages with GopherJS and runs their tests:
 
-[![Build Status](https://travis-ci.org/gopherjs/gopherjs.png?branch=master)](https://travis-ci.org/gopherjs/gopherjs)
+[![Circle CI](https://circleci.com/gh/gopherjs/gopherjs.svg?style=svg)](https://circleci.com/gh/gopherjs/gopherjs)
 
 | Name            | Supported (Tests OK?) | Comment                           |
 | --------------- | --------------------- | --------------------------------- |
@@ -47,7 +47,7 @@ On each commit, Travis CI automatically compiles all supported packages with Gop
 | -- -- driver    | yes                   |                                   |
 | debug           |                       |                                   |
 | -- dwarf        | not yet               |                                   |
-| -- elf          | no                    |                                   |
+| -- elf          | not yet               |                                   |
 | -- gosym        | yes                   |                                   |
 | -- macho        | not yet               |                                   |
 | -- pe           | yes                   |                                   |
@@ -58,23 +58,23 @@ On each commit, Travis CI automatically compiles all supported packages with Gop
 | -- base64       | yes                   |                                   |
 | -- binary       | yes                   |                                   |
 | -- csv          | yes                   |                                   |
-| -- gob          | soon                  | will become supported with Go 1.4 |
+| -- gob          | yes                   |                                   |
 | -- hex          | yes                   |                                   |
 | -- json         | yes                   |                                   |
 | -- pem          | yes                   |                                   |
 | -- xml          | yes                   |                                   |
 | errors          | yes                   |                                   |
-| expvar          | no                    |                                   |
+| expvar          | yes                   |                                   |
 | flag            | not yet               |                                   |
 | fmt             | yes                   |                                   |
 | go              |                       |                                   |
-| -- ast          | not yet               |                                   |
+| -- ast          | yes                   |                                   |
 | -- build        | not yet               |                                   |
-| -- doc          | not yet               |                                   |
+| -- doc          | yes                   |                                   |
 | -- format       | yes                   |                                   |
-| -- parser       | not yet               |                                   |
+| -- parser       | yes                   |                                   |
 | -- printer      | yes                   |                                   |
-| -- scanner      | not yet               |                                   |
+| -- scanner      | yes                   |                                   |
 | -- token        | yes                   |                                   |
 | hash            | (no tests)            |                                   |
 | -- adler32      | yes                   |                                   |
@@ -101,7 +101,7 @@ On each commit, Travis CI automatically compiles all supported packages with Gop
 | -- cmplx        | yes                   |                                   |
 | -- rand         | yes                   |                                   |
 | mime            | yes                   |                                   |
-| -- multipart    | no                    |                                   |
+| -- multipart    | yes                   |                                   |
 | net             | no                    |                                   |
 | -- http         | partially             | data structures only (no net)     |
 | -- -- cgi       | not yet               |                                   |
